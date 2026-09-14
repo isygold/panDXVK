@@ -1,0 +1,125 @@
+name: WCP Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      version_name:
+        description: 'Version number, e.g. 1.10.3.0 (will become pandxvk-1.10.3.0-<sha> in profile.json)'
+        required: true
+        type: string
+        default: '1.10.3'
+      version_code:
+        description: 'Build number (auto if blank)'
+        required: false
+        type: string
+        default: ''
+      release_description:
+        description: 'Short description for profile.json'
+        required: false
+        type: string
+        default: 'panDXVK - DXVK fork for PanVK/Mali-G720'
+
+permissions:
+  actions: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install zstd
+        run: sudo apt-get update -y && sudo apt-get install -y zstd
+
+      - name: Resolve version inputs
+        id: version
+        run: |
+          VNAME="${{ inputs.version_name }}"
+          echo "version_name=$VNAME" >> "$GITHUB_OUTPUT"
+
+          # Auto versionCode if not provided: use timestamp
+          VCODE="${{ inputs.version_code }}"
+          if [ -z "$VCODE" ]; then
+            VCODE=$(date +%s)
+          fi
+          echo "version_code=$VCODE" >> "$GITHUB_OUTPUT"
+
+      - name: Get latest build SHA and run ID
+        id: get-sha
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          RUN_JSON=$(gh run list --repo ${{ github.repository }} --workflow build.yml --branch main \
+            --status success --limit 1 --json headSha,databaseId)
+          if [ -z "$RUN_JSON" ] || [ "$RUN_JSON" = "[]" ]; then
+            echo "::error::No successful build.yml runs found on branch main."
+            echo "::error::Trigger a Build DXVK (x64 + x32) workflow first."
+            exit 1
+          fi
+          FULL_SHA=$(echo "$RUN_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin)[0]['headSha'])")
+          RUN_ID=$(echo "$RUN_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin)[0]['databaseId'])")
+          echo "full_sha=$FULL_SHA" >> "$GITHUB_OUTPUT"
+          echo "sha=${FULL_SHA:0:7}" >> "$GITHUB_OUTPUT"
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Download build DLLs
+        uses: actions/download-artifact@v4
+        with:
+          name: dxvk-${{ steps.get-sha.outputs.full_sha }}
+          path: ./workdir
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          run-id: ${{ steps.get-sha.outputs.run_id }}
+
+      - name: Restructure for WCP
+        run: |
+          cd ./workdir
+          VDIR="$(ls -d dxvk-*/)"
+          mv "$VDIR/x64" ./
+          mv "$VDIR/x32" ./
+          rm -rf "$VDIR"
+
+      - name: Prepare DLL directories
+        run: |
+          cd ./workdir
+          mv x64 system32
+          mv x32 syswow64
+
+      - name: Package WCP
+        run: |
+          cd ./workdir
+          cat > profile.json << 'JSONEOF'
+          {
+            "type": "DXVK",
+            "versionName": "pandxvk-${{ steps.version.outputs.version_name }}-${{ steps.get-sha.outputs.sha }}",
+            "versionCode": ${{ steps.version.outputs.version_code }},
+            "description": "${{ inputs.release_description }}",
+            "files": [
+              {"source": "system32/d3d9.dll",      "target": "${system32}/d3d9.dll"},
+              {"source": "system32/d3d10core.dll", "target": "${system32}/d3d10core.dll"},
+              {"source": "system32/d3d11.dll",     "target": "${system32}/d3d11.dll"},
+              {"source": "system32/dxgi.dll",      "target": "${system32}/dxgi.dll"},
+              {"source": "syswow64/d3d8.dll",      "target": "${syswow64}/d3d8.dll"},
+              {"source": "syswow64/d3d9.dll",      "target": "${syswow64}/d3d9.dll"},
+              {"source": "syswow64/d3d10core.dll", "target": "${syswow64}/d3d10core.dll"},
+              {"source": "syswow64/d3d11.dll",     "target": "${syswow64}/d3d11.dll"},
+              {"source": "syswow64/dxgi.dll",      "target": "${syswow64}/dxgi.dll"}
+            ]
+          }
+          JSONEOF
+          tar --zstd -cf "../pandxvk-${{ steps.version.outputs.version_name }}-${{ steps.get-sha.outputs.sha }}.wcp" \
+            system32/ syswow64/ profile.json
+
+      - name: Upload WCP
+        uses: actions/upload-artifact@v4
+        with:
+          name: wcp-pandxvk-${{ steps.version.outputs.version_name }}-${{ steps.get-sha.outputs.sha }}
+          path: ./pandxvk-*.wcp
+
+      - name: Upload panDXVK config
+        uses: actions/upload-artifact@v4
+        with:
+          name: pandxvk-config-${{ steps.version.outputs.version_name }}-${{ steps.get-sha.outputs.sha }}
+          path: pandxvk/

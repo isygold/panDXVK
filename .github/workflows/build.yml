@@ -1,0 +1,113 @@
+name: Build DXVK (x64 + x32)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  # ----------------------------------------------------------------
+  # Compute a sanitized version string (no / in branch names)
+  # ----------------------------------------------------------------
+  setup:
+    name: Setup
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.set_version.outputs.version }}
+    steps:
+      - name: Compute version
+        id: set_version
+        run: |
+          SANITIZED_REF="${GITHUB_REF_NAME//\//-}"
+          echo "version=${SANITIZED_REF}-${GITHUB_SHA:0:7}" >> "$GITHUB_OUTPUT"
+
+  # ----------------------------------------------------------------
+  # MinGW x64 cross-build
+  # ----------------------------------------------------------------
+  build-mingw-x64:
+    name: MinGW x64
+    runs-on: ubuntu-latest
+    needs: [setup]
+    container:
+      image: fedora:44
+      options: --user root
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install dependencies
+        run: |
+          dnf install -y \
+            git \
+            mingw64-gcc mingw64-gcc-c++ mingw64-binutils mingw64-crt \
+            mingw64-winpthreads mingw64-vulkan-headers mingw64-spirv-headers \
+            glslang meson ninja-build pkgconf
+
+      - name: Build x64
+        run: |
+          chmod +x package-release.sh
+          ./package-release.sh \
+            "${{ needs.setup.outputs.version }}" \
+            build \
+            --no-package --64-only --build-id
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dxvk-x64-${{ github.sha }}
+          path: build/
+          if-no-files-found: error
+
+  # ----------------------------------------------------------------
+  # MinGW x32 cross-build
+  # ----------------------------------------------------------------
+  build-mingw-x32:
+    name: MinGW x32
+    runs-on: ubuntu-latest
+    needs: [setup]
+    container:
+      image: fedora:44
+      options: --user root
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install dependencies
+        run: |
+          dnf install -y \
+            git \
+            mingw32-gcc mingw32-gcc-c++ mingw32-binutils mingw32-crt \
+            mingw32-winpthreads mingw32-vulkan-headers mingw32-spirv-headers \
+            glslang meson ninja-build pkgconf
+
+      - name: Build x32
+        run: |
+          chmod +x package-release.sh
+          ./package-release.sh \
+            "${{ needs.setup.outputs.version }}" \
+            build \
+            --no-package --32-only --build-id
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dxvk-x32-${{ github.sha }}
+          path: build/
+          if-no-files-found: error
+
+  # ----------------------------------------------------------------
+  # Merge x64 + x32 into a single release artifact
+  # ----------------------------------------------------------------
+  merge-artifacts:
+    name: Merge artifacts
+    runs-on: ubuntu-latest
+    needs: [build-mingw-x64, build-mingw-x32]
+    steps:
+      - name: Merge
+        uses: actions/upload-artifact/merge@v4
+        with:
+          name: dxvk-${{ github.sha }}
+          pattern: dxvk-*-${{ github.sha }}
+          delete-merged: true
