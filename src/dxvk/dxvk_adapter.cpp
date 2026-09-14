@@ -110,6 +110,9 @@ namespace dxvk {
 
 
   bool DxvkAdapter::checkFeatureSupport(const DxvkDeviceFeatures& required) const {
+    // panDXVK gate: identify PanVK/Mali adapter (vendorID 0x13b5)
+    const bool isPanVK = (m_deviceFeatures.core.properties.vendorID == 0x13b5);
+
     return (m_deviceFeatures.core.features.robustBufferAccess
                 || !required.core.features.robustBufferAccess)
         && (m_deviceFeatures.core.features.fullDrawIndexUint32
@@ -118,8 +121,9 @@ namespace dxvk {
                 || !required.core.features.imageCubeArray)
         && (m_deviceFeatures.core.features.independentBlend
                 || !required.core.features.independentBlend)
-        && (m_deviceFeatures.core.features.geometryShader
-                || !required.core.features.geometryShader)
+        // panDXVK: geometryShader — WIP upstream, gate off for PanVK
+        && (isPanVK || (m_deviceFeatures.core.features.geometryShader
+                || !required.core.features.geometryShader))
         && (m_deviceFeatures.core.features.tessellationShader
                 || !required.core.features.tessellationShader)
         && (m_deviceFeatures.core.features.sampleRateShading
@@ -146,16 +150,18 @@ namespace dxvk {
                 || !required.core.features.largePoints)
         && (m_deviceFeatures.core.features.alphaToOne
                 || !required.core.features.alphaToOne)
-        && (m_deviceFeatures.core.features.multiViewport
-                || !required.core.features.multiViewport)
+        // panDXVK: multiViewport — hardware ceiling, gate off for PanVK
+        && (isPanVK || (m_deviceFeatures.core.features.multiViewport
+                || !required.core.features.multiViewport))
         && (m_deviceFeatures.core.features.samplerAnisotropy
                 || !required.core.features.samplerAnisotropy)
         && (m_deviceFeatures.core.features.textureCompressionETC2
                 || !required.core.features.textureCompressionETC2)
         && (m_deviceFeatures.core.features.textureCompressionASTC_LDR
                 || !required.core.features.textureCompressionASTC_LDR)
-        && (m_deviceFeatures.core.features.textureCompressionBC
-                || !required.core.features.textureCompressionBC)
+        // panDXVK: textureCompressionBC - waiting on panVK BCn translator, gate off for PanVK
+        && (isPanVK || (m_deviceFeatures.core.features.textureCompressionBC
+                || !required.core.features.textureCompressionBC))
         && (m_deviceFeatures.core.features.occlusionQueryPrecise
                 || !required.core.features.occlusionQueryPrecise)
         && (m_deviceFeatures.core.features.pipelineStatisticsQuery
@@ -184,10 +190,12 @@ namespace dxvk {
                 || !required.core.features.shaderStorageBufferArrayDynamicIndexing)
         && (m_deviceFeatures.core.features.shaderStorageImageArrayDynamicIndexing
                 || !required.core.features.shaderStorageImageArrayDynamicIndexing)
-        && (m_deviceFeatures.core.features.shaderClipDistance
-                || !required.core.features.shaderClipDistance)
-        && (m_deviceFeatures.core.features.shaderCullDistance
-                || !required.core.features.shaderCullDistance)
+        // panDXVK: shaderClipDistance - hardware ceiling, gate off for PanVK
+        && (isPanVK || (m_deviceFeatures.core.features.shaderClipDistance
+                || !required.core.features.shaderClipDistance))
+        // panDXVK: shaderCullDistance - hardware ceiling, gate off for PanVK
+        && (isPanVK || (m_deviceFeatures.core.features.shaderCullDistance
+                || !required.core.features.shaderCullDistance))
         && (m_deviceFeatures.core.features.shaderFloat64
                 || !required.core.features.shaderFloat64)
         && (m_deviceFeatures.core.features.shaderInt64

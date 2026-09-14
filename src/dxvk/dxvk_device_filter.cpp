@@ -34,6 +34,14 @@ namespace dxvk {
       }
     }
 
+    // panDXVK: skip Adreno adapters (vendorID 0x5143)
+    if (m_flags.test(DxvkDeviceFilterFlag::SkipAdrenoDevices)) {
+      if (properties.vendorID == 0x5143) {
+        Logger::warn(str::format("Skipping Adreno adapter: ", properties.deviceName));
+        return false;
+      }
+    }
+
     return true;
   }
   

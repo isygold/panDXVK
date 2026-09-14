@@ -170,6 +170,9 @@ namespace dxvk {
         filterFlags.set(DxvkDeviceFilterFlag::SkipCpuDevices);
     }
 
+    // panDXVK: always skip Adreno adapters
+    filterFlags.set(DxvkDeviceFilterFlag::SkipAdrenoDevices);
+
     DxvkDeviceFilter filter(filterFlags);
     std::vector<Rc<DxvkAdapter>> result;
 

@@ -12,8 +12,9 @@ namespace dxvk {
    * If no flags are set, all devices pass the test.
    */
   enum class DxvkDeviceFilterFlag {
-    MatchDeviceName   = 0,
-    SkipCpuDevices    = 1,
+    MatchDeviceName    = 0,
+    SkipCpuDevices     = 1,
+    SkipAdrenoDevices  = 2,
   };
   
   using DxvkDeviceFilterFlags = Flags<DxvkDeviceFilterFlag>;
