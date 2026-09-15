@@ -77,12 +77,15 @@
 #define D3DPRESENT_FORCEIMMEDIATE              0x00000100L
 #endif
 
-// MinGW headers are broken. Who'dve guessed?
+// Missing in some versions of mingw headers
 #ifndef _MSC_VER
-typedef struct _D3DDEVINFO_RESOURCEMANAGER
-{
-  char dummy;
-} D3DDEVINFO_RESOURCEMANAGER, * LPD3DDEVINFO_RESOURCEMANAGER;
+namespace dxvk {
+  typedef struct _D3DDEVINFO_RESOURCEMANAGER
+  {
+    char dummy;
+  } D3DDEVINFO_RESOURCEMANAGER, * LPD3DDEVINFO_RESOURCEMANAGER;
+}
+#endif
 
 #ifndef __WINE__
 extern "C" WINUSERAPI WINBOOL WINAPI SetProcessDPIAware(VOID);
