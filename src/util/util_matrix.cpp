@@ -1,3 +1,4 @@
+#include <cstdint>
 #include "util_matrix.h"
 
 namespace dxvk {
