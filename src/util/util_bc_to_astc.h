@@ -1,5 +1,6 @@
 #pragma once
 
+#include <memory>
 #include "../dxvk/dxvk_format.h"
 #include "util_bc_decode.h"
 #include "util_astc_encode.h"
@@ -154,6 +155,36 @@ namespace dxvk::util {
     // Step 2: Encode RGBA8 to ASTC 4x4
     encodeAstcImage4x4(rgbaData.data(), width, height,
                        width * 4, dstData, dstRowPitch);
+  }
+
+
+  /**
+   * \brief Transcodes BC data to ASTC 4x4, heap-allocated result
+   *
+   * Returns nullptr on failure. Caller owns the result.
+   * Use this instead of the void overload when the caller
+   * needs to hold the transcoded data across scope boundaries.
+   *
+   * \param [in]  bcFormat    Source BC format (DXGI_FORMAT_BC1..BC7)
+   * \param [in]  srcData     Source BC data
+   * \param [in]  width       Image width in pixels
+   * \param [in]  height      Image height in pixels
+   * \param [in]  srcRowPitch Source row pitch in bytes
+   * \returns Heap-allocated ASTC 4x4 data, or nullptr on failure
+   */
+  inline std::unique_ptr<uint8_t[]> transcodeBcToAstcAlloc(
+          DXGI_FORMAT    bcFormat,
+    const uint8_t*       srcData,
+          uint32_t       width,
+          uint32_t       height,
+          VkDeviceSize   srcRowPitch) {
+    VkDeviceSize dstSize = computeAstcImageDataSize(width, height);
+    auto dstData = std::make_unique<uint8_t[]>(static_cast<size_t>(dstSize));
+
+    transcodeBcToAstc(bcFormat, srcData, width, height,
+                      srcRowPitch, dstData.get(), width * 4);
+
+    return dstData;
   }
 
 

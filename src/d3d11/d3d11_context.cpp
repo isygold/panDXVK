@@ -3698,8 +3698,9 @@ namespace dxvk {
     VkFormat packedFormat = pDstTexture->GetPackedFormat();
 
     // panDXVK: Transcode BC→ASTC if destination is ASTC (PanVK detected)
-    // Must keep astcData alive for the entire function — pSrcData points into it.
-    std::vector<uint8_t> astcData;
+    // Use heap allocation — ASTC output can be ~8MB for 4K textures,
+    // and DXVK thread stacks may be as small as 1MB.
+    std::unique_ptr<uint8_t[]> astcData;
 
     if (util::isBcFormat(packedFormat)
         && m_device->GetDXVKDevice()->adapter()->isPanVk()) {
@@ -3707,18 +3708,18 @@ namespace dxvk {
         pDstTexture->GetSubresourceFromIndex(
           imageFormatInfo(packedFormat)->aspectMask, DstSubresource).mipLevel);
 
-      astcData = util::transcodeBcToAstc(
-        pSrcData, packedFormat,
+      astcData = util::transcodeBcToAstcAlloc(
+        packedFormat, pSrcData,
         srcExtent.width, srcExtent.height,
         SrcRowPitch);
 
-      if (astcData.empty()) {
+      if (!astcData) {
         Logger::err("panDXVK: BC→ASTC transcode failed, skipping UpdateTexture");
         return;
       }
 
       // Override src data + format for the staging buffer path below.
-      pSrcData = astcData.data();
+      pSrcData = astcData.get();
       SrcRowPitch = srcExtent.width * 4;
       packedFormat = util::bcToAstcFormat(packedFormat);
     }
