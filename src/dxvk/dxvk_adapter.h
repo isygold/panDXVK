@@ -256,6 +256,18 @@ namespace dxvk {
      * \returns \c true if the system has unified memory.
      */
     bool isUnifiedMemoryArchitecture() const;
+
+    /**
+     * \brief Checks whether this adapter is a PanVK / Mali device
+     *
+     * panDXVK: used to gate BC texture → ASTC transcode
+     * and other PanVK-specific workarounds.
+     * \returns \c true if vendor is ARM (0x13b5)
+     */
+    bool isPanVk() const {
+      return m_deviceInfo.core.properties.vendorID
+        == static_cast<uint32_t>(DxvkGpuVendor::Arm);
+    }
     
   private:
     
