@@ -41,7 +41,7 @@ panDXVK uses the same configuration mechanism as upstream DXVK. Set `DXVK_CONFIG
 | `DXVK_FRAME_RATE` | `0` (uncap), or FPS limit | Frame rate cap. |
 
 ## Notes
-- **I need your logs.** If you hit a crash, rendering glitch, or anything weird, grab the log file from your Wine prefix's drive_c (usually `wine_debug.log` or `d3d11.log` in the app directory) and attach it to your issue. Alternatively, set `DXVK_LOG_LEVEL=info` before launching the game so the log captures BC→ASTC transcode activity and other useful state. Without logs, I cannot help you.
+- **I need your logs.** If you hit a crash, rendering glitch, or anything weird, grab the log file from your Wine prefix's drive_c (usually `wine_debug.log` or `d3d11.log` in the app directory) and paste it to [panDXVK Logs](https://github.com/isygold/panDXVK-logs/issues). Set `DXVK_LOG_LEVEL=info` before launching the game so the log captures BC→ASTC transcode activity. Without logs, I cannot help you.
 - **ASTC 4x4 is lossy.** BC1–BC7 textures are decoded to RGBA8 and re-encoded to ASTC 4x4. This introduces compression artifacts not present in the original. For most games the visual difference is minimal, but texture-heavy UIs or screenshots may show subtle banding.
 - **BC6H maps to ASTC 6x6 LDR.** BC6H (HDR float RGB) is approximated as ASTC 6x6 UNORM. Full HDR fidelity is not preserved.
 - **PanVK must be the active Vulkan driver.** panDXVK detects Mali via vendor ID `0x13B5`. If you are running a blob driver that already reports `textureCompressionBC = true`, the transcode is skipped entirely — the game's BC textures are uploaded as-is.
