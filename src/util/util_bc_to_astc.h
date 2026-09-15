@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstdint>
+
 #include <memory>
 #include "../dxvk/dxvk_format.h"
 #include "util_bc_decode.h"

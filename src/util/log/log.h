@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstdint>
+
 #include <array>
 #include <fstream>
 #include <iostream>

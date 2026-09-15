@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstdint>
+
 #define ENUM_NAME(name) \
   case name: return os << #name
 
