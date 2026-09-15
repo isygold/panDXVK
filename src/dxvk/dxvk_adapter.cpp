@@ -111,7 +111,7 @@ namespace dxvk {
 
   bool DxvkAdapter::checkFeatureSupport(const DxvkDeviceFeatures& required) const {
     // panDXVK gate: identify PanVK/Mali adapter (vendorID 0x13b5)
-    const bool isPanVK = (m_deviceFeatures.core.properties.vendorID == 0x13b5);
+    const bool isPanVK = (m_deviceInfo.core.properties.vendorID == 0x13b5);
 
     return (m_deviceFeatures.core.features.robustBufferAccess
                 || !required.core.features.robustBufferAccess)
