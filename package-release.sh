@@ -24,6 +24,7 @@ shift 2
 opt_nopackage=0
 opt_devbuild=0
 opt_buildid=false
+opt_64only=0
 
 crossfile="build-win"
 
@@ -38,6 +39,9 @@ while [ $# -gt 0 ]; do
     ;;
   "--build-id")
     opt_buildid=true
+    ;;
+  "--64-only")
+    opt_64only=1
     ;;
   *)
     echo "Unrecognized option: $1" >&2
@@ -89,7 +93,9 @@ function package {
 }
 
 build_arch 64
-build_arch 32
+if [ $opt_64only -eq 0 ]; then
+  build_arch 32
+fi
 build_script
 
 if [ $opt_nopackage -eq 0 ]; then
