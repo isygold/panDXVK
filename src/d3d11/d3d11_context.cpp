@@ -3709,15 +3709,29 @@ namespace dxvk {
         pDstTexture->GetSubresourceFromIndex(
           imageFormatInfo(packedFormat)->aspectMask, DstSubresource).mipLevel);
 
+      auto t0 = std::chrono::high_resolution_clock::now();
+
       astcData = util::transcodeBcToAstcAlloc(
         packedFormat, pSrcData,
         srcExtent.width, srcExtent.height,
         SrcRowPitch);
 
+      auto t1 = std::chrono::high_resolution_clock::now();
+      double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
       if (!astcData) {
-        Logger::err("panDXVK: BC→ASTC transcode failed, skipping UpdateTexture");
+        Logger::err(str::format(
+          "panDXVK: BC\u2192ASTC transcode FAILED ",
+          srcExtent.width, "x", srcExtent.height, " ",
+          "DXGI_FORMAT=", packedFormat, " sub=", DstSubresource));
         return;
       }
+
+      Logger::info(str::format(
+        "panDXVK: BC\u2192ASTC transcode ",
+        srcExtent.width, "x", srcExtent.height, " ",
+        "DXGI_FORMAT=", packedFormat, " sub=", DstSubresource,
+        " ", ms, "ms"));
 
       // Override src data + format for the staging buffer path below.
       pSrcData = astcData.get();

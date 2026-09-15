@@ -31,6 +31,10 @@ namespace dxvk {
         && util::isBcFormat(m_desc.Format)) {
       astcFormat = util::bcToAstcFormat(m_desc.Format);
       if (astcFormat != VK_FORMAT_UNDEFINED) {
+        Logger::info(str::format(
+          "panDXVK: BC\u2192ASTC remap VkImage ",
+          m_desc.Width, "x", m_desc.Height, " ",
+          "DXGI_FORMAT=", m_desc.Format, " \u2192 ASTC_4x4"));
         formatInfo.Format = astcFormat;
         formatFamily.FormatCount = 1;
         formatFamily.Formats[0] = astcFormat;
