@@ -115,7 +115,18 @@ namespace dxvk {
     const DxvkDeviceFeatures& features() const {
       return m_deviceFeatures;
     }
-    
+
+    /**
+     * \brief Tests whether this is a PanVK device (ARM Mali)
+     *
+     * Checks vendor ID 0x13B5 (ARM Ltd.) to identify
+     * Mali GPUs running the PanVK Mesa driver.
+     * \returns \c true if device vendor is ARM
+     */
+    bool isPanVk() const {
+      return m_deviceInfo.core.properties.vendorID == 0x13B5;
+    }
+
     /**
      * \brief Retrieves memory heap info
      * 

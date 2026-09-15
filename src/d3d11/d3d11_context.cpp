@@ -3712,7 +3712,7 @@ namespace dxvk {
       auto t0 = std::chrono::high_resolution_clock::now();
 
       astcData = util::transcodeBcToAstcAlloc(
-        packedFormat, pSrcData,
+        packedFormat, static_cast<const uint8_t*>(pSrcData),
         srcExtent.width, srcExtent.height,
         SrcRowPitch);
 
