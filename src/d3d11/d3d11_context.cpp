@@ -3703,8 +3703,8 @@ namespace dxvk {
     std::unique_ptr<uint8_t[]> astcData;
 
     if (util::isBcFormat(packedFormat)
-        && m_device->GetDXVKDevice()->adapter()->isPanVk()
-        && !m_device->GetDXVKDevice()->adapter()->features().core.features.textureCompressionBC) {
+        && m_device->adapter()->isPanVk()
+        && !m_device->features().core.features.textureCompressionBC) {
       auto srcExtent = pDstTexture->MipLevelExtent(
         pDstTexture->GetSubresourceFromIndex(
           imageFormatInfo(packedFormat)->aspectMask, DstSubresource).mipLevel);
