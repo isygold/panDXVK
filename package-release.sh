@@ -25,6 +25,7 @@ opt_nopackage=0
 opt_devbuild=0
 opt_buildid=false
 opt_64only=0
+opt_32only=0
 
 crossfile="build-win"
 
@@ -42,6 +43,9 @@ while [ $# -gt 0 ]; do
     ;;
   "--64-only")
     opt_64only=1
+    ;;
+  "--32-only")
+    opt_32only=1
     ;;
   *)
     echo "Unrecognized option: $1" >&2
@@ -92,7 +96,9 @@ function package {
   rm -R "dxvk-$DXVK_VERSION"
 }
 
-build_arch 64
+if [ $opt_32only -eq 0 ]; then
+  build_arch 64
+fi
 if [ $opt_64only -eq 0 ]; then
   build_arch 32
 fi
