@@ -93,7 +93,7 @@ jobs:
           cat > profile.json << 'JSONEOF'
           {
             "type": "DXVK",
-            "versionName": "pandxvk-${{ steps.version.outputs.version_name }}-${{ steps.get-sha.outputs.sha }}",
+            "versionName": "pandxvk-${{ steps.version.outputs.version_name }}",
             "versionCode": ${{ steps.version.outputs.version_code }},
             "description": "${{ inputs.release_description }}",
             "files": [
@@ -112,7 +112,7 @@ jobs:
             ]
           }
           JSONEOF
-          tar --zstd -cf "../pandxvk-${{ steps.version.outputs.version_name }}-${{ steps.get-sha.outputs.sha }}.wcp" \
+          tar --zstd -cf "../pandxvk-${{ steps.version.outputs.version_name }}.wcp" \
             system32/ syswow64/ profile.json
 
       - name: Wrap WCP in zip
@@ -130,7 +130,7 @@ jobs:
       - name: Upload WCP
         uses: actions/upload-artifact@v4
         with:
-          name: wcp-pandxvk-${{ steps.version.outputs.version_name }}-${{ steps.get-sha.outputs.sha }}
+          name: wcp-pandxvk-${{ steps.version.outputs.version_name }}
           path: ./workdir/wcp.zip
 
       - name: Upload panDXVK config
