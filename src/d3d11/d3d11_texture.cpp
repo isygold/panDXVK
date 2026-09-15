@@ -3,6 +3,7 @@
 #include "d3d11_texture.h"
 
 #include "../util/util_shared_res.h"
+#include "../util/util_bc_to_astc.h"
 
 namespace dxvk {
   
@@ -20,6 +21,21 @@ namespace dxvk {
     DXGI_VK_FORMAT_FAMILY formatFamily = m_device->LookupFamily(m_desc.Format, formatMode);
     DXGI_VK_FORMAT_INFO   formatPacked = m_device->LookupPackedFormat(m_desc.Format, formatMode);
     m_packedFormat = formatPacked.Format;
+
+    // panDXVK: Remap BC formats to ASTC on PanVK/Mali
+    // BC textureCompressionBC is not supported on panVK.
+    // Skip if the driver already supports BC (blob driver on G610+).
+    VkFormat astcFormat = VK_FORMAT_UNDEFINED;
+    if (m_device->GetDXVKDevice()->adapter()->isPanVk()
+        && !m_device->GetDXVKDevice()->adapter()->features().core.features.textureCompressionBC
+        && util::isBcFormat(m_desc.Format)) {
+      astcFormat = util::bcToAstcFormat(m_desc.Format);
+      if (astcFormat != VK_FORMAT_UNDEFINED) {
+        formatInfo.Format = astcFormat;
+        formatFamily.FormatCount = 1;
+        formatFamily.Formats[0] = astcFormat;
+      }
+    }
 
     DxvkImageCreateInfo imageInfo;
     imageInfo.type            = GetVkImageType();
