@@ -145,15 +145,17 @@ namespace dxvk::util {
           uint8_t*       dstData,
           VkDeviceSize   dstRowPitch) {
     // Step 1: Decode BC to RGBA8 (intermediate)
+    // Heap allocation — RGBA8 intermediate is width*height*4 bytes,
+    // can be ~33MB for 4K textures. Stack overflow risk if on stack.
     BcFormat bc = dxgiToBcFormat(bcFormat);
 
-    std::vector<uint8_t> rgbaData(width * height * 4);
+    auto rgbaData = std::make_unique<uint8_t[]>(width * height * 4);
 
     decodeBcImage(bc, srcData, width, height, srcRowPitch,
-                  rgbaData.data(), width * 4);
+                  rgbaData.get(), width * 4);
 
     // Step 2: Encode RGBA8 to ASTC 4x4
-    encodeAstcImage4x4(rgbaData.data(), width, height,
+    encodeAstcImage4x4(rgbaData.get(), width, height,
                        width * 4, dstData, dstRowPitch);
   }
 
