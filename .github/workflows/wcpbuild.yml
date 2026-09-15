@@ -115,11 +115,23 @@ jobs:
           tar --zstd -cf "../pandxvk-${{ steps.version.outputs.version_name }}-${{ steps.get-sha.outputs.sha }}.wcp" \
             system32/ syswow64/ profile.json
 
+      - name: Wrap WCP in zip
+        run: |
+          cd ..
+          python3 -c "
+          import zipfile, glob
+          wcp_files = glob.glob('workdir/*.wcp')
+          with zipfile.ZipFile('wcp.zip', 'w', zipfile.ZIP_STORED) as zf:
+              for f in wcp_files:
+                  zf.write(f)
+          "
+          mv wcp.zip workdir/wcp.zip
+
       - name: Upload WCP
         uses: actions/upload-artifact@v4
         with:
           name: wcp-pandxvk-${{ steps.version.outputs.version_name }}-${{ steps.get-sha.outputs.sha }}
-          path: ./pandxvk-*.wcp
+          path: ./workdir/wcp.zip
 
       - name: Upload panDXVK config
         uses: actions/upload-artifact@v4
