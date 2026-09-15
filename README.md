@@ -2,7 +2,7 @@
 
 panDXVK is a specialized DXVK translation layer built exclusively for the panVK (Panfrost / ARM Mali Vulkan) driver.
 
-Based on [DXVK v1.10.3](https://github.com/doitsujin/dxvk/tree/v1.10.3). Adds a BC texture → ASTC 4x4 transcode pipeline so that PC games using BC1–BC7 compressed textures can render correctly on Mali GPUs via PanVK, which does not report `textureCompressionBC`.
+Based on [DXVK v1.10.3](https://github.com/doitsujin/dxvk/tree/v1.10.3), forked from [pythonlover02/dxvk-sarek](https://github.com/pythonlover02/dxvk-sarek). Adds a BC texture → ASTC 4x4 transcode pipeline so that PC games using BC1–BC7 compressed textures can render correctly on Mali GPUs via PanVK, which does not report `textureCompressionBC`.
 
 ## Key Features
 - **BC→ASTC Transcode**: Software decode of BC1–BC7 to RGBA8, then encode to ASTC 4x4. Mali hardware decodes ASTC natively.
@@ -50,7 +50,8 @@ panDXVK uses the same configuration mechanism as upstream DXVK. Set `DXVK_CONFIG
 - **AppendSlice path not yet patched.** The `AppendSlice` D3D11 path may also encounter BC textures. This is a known gap. If you see BC format errors in `AppendSlice`, file an issue.
 - **CI builds are automated.** The GitHub Actions workflow builds both x64 and x32 on Fedora 44 with MinGW-w64. If the Fedora mirror is temporarily unreachable, the workflow retries automatically.
 
-## Upstream DXVK Reference
-- Upstream: [doitsujin/dxvk](https://github.com/doitsujin/dxvk)
+## Upstream Reference
+- Upstream DXVK: [doitsujin/dxvk](https://github.com/doitsujin/dxvk)
+- DXVK Sarek: [pythonlover02/dxvk-sarek](https://github.com/pythonlover02/dxvk-sarek)
 - Forked from: [v1.10.3](https://github.com/doitsujin/dxvk/tree/v1.10.3)
 - Upstream latest: [v3.1](https://github.com/doitsujin/dxvk/releases/tag/v3.1)
