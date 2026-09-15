@@ -9,7 +9,6 @@
 #ifndef _SHA1_H
 #define _SHA1_H
 
-#include <cstdint>
 #include <stddef.h>
 #include <stdint.h>
 
