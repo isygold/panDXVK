@@ -3698,6 +3698,8 @@ namespace dxvk {
     VkFormat packedFormat = pDstTexture->GetPackedFormat();
 
     // panDXVK: Transcode BC→ASTC if destination is ASTC (PanVK detected)
+    // BUG-FIX: Do NOT recurse into UpdateTexture — use ASTC row pitch
+    // for the staging buffer pack so the normal path handles it directly.
     if (util::isBcFormat(packedFormat)
         && m_device->GetDXVKDevice()->adapter()->isPanVk()) {
       auto srcExtent = pDstTexture->MipLevelExtent(
@@ -3710,10 +3712,12 @@ namespace dxvk {
         SrcRowPitch);
 
       if (!astcData.empty()) {
-        VkFormat astcFormat = util::bcToAstcFormat(packedFormat);
-        UpdateTexture(pDstTexture, DstSubresource, pDstBox,
-          astcData.data(), srcExtent.width * 4, 0);
-        return;
+        // Override SrcRowPitch with ASTC row pitch (4 bytes/block × blocks_x)
+        // Falls through to normal staging buffer path — no recursion.
+        pSrcData = astcData.data();
+        SrcRowPitch = srcExtent.width * 4;
+        packedFormat = util::bcToAstcFormat(packedFormat);
+        // Note: formatInfo lookup below uses the new packedFormat
       }
     }
 
