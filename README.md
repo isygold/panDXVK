@@ -12,23 +12,23 @@ Based on [DXVK v1.10.3](https://github.com/doitsujin/dxvk/tree/v1.10.3), forked 
 - **Transcode Timing**: INFO-level logging reports per-subresource transcode time for profiling.
 - **x64 + x32**: Both 64-bit and 32-bit DLLs built and verified.
 
-## Installation
-1. Download the latest release artifact from [Releases](https://github.com/isygold/panDXVK/releases).
-2. Extract the archive.
-3. Set your Wine prefix and install:
-   ```
-   export WINEPREFIX=/path/to/.wine-prefix
-   ./setup_dxvk.sh install
-   ```
-4. To install with D3D10 helper libraries, add `--with-d3d10`.
-5. To use symbolic links instead of copies (useful for development), add `--symlink`.
-6. Verify DXVK is active by checking for `d3d11.log` in the application directory.
+## Installation (Winlator / Bannerlator)
 
-To uninstall:
-```
-export WINEPREFIX=/path/to/.wine-prefix
-./setup_dxvk.sh uninstall
-```
+**Option A — WCP (recommended):**
+1. Download `wcp.zip` from the [Releases](https://github.com/isygold/panDXVK/releases) page.
+2. In Winlator/Bannerlator, go to **Container Settings → Content**.
+3. Tap **Install** and select the downloaded `wcp.zip`.
+4. Launch your game. panDXVK will automatically detect Mali and transcode BC textures to ASTC.
+
+**Option B — Manual DLL replacement:**
+1. Download `merged.zip` (x64 + x32 DLLs) from the [Releases](https://github.com/isygold/panDXVK/releases) page.
+2. Extract the archive.
+3. Inside Winlator/Bannerlator, go to **Container Settings → Advanced → DXVK/Sarek**.
+4. Replace the existing `d3d11.dll`, `dxgi.dll`, `d3d10.dll`, `d3d10_1.dll`, `d3d9.dll` with the ones from the extracted folder matching your container's architecture:
+   - 64-bit containers → `x64/` folder
+   - 32-bit containers → `x32/` folder
+5. Alternatively, copy the DLLs into the Wine prefix's `system32` (64-bit) or `syswow64` (32-bit) directory.
+6. Launch your game.
 
 ## Configuration
 panDXVK uses the same configuration mechanism as upstream DXVK. Set `DXVK_CONFIG_FILE` to point to a `dxvk.conf` file, or use environment variables:
