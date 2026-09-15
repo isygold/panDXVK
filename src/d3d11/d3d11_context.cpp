@@ -7,6 +7,7 @@
 #include "d3d11_video.h"
 
 #include "../dxbc/dxbc_util.h"
+#include "../util/util_bc_to_astc.h"
 
 namespace dxvk {
   
@@ -3695,6 +3696,26 @@ namespace dxvk {
       return;
 
     VkFormat packedFormat = pDstTexture->GetPackedFormat();
+
+    // panDXVK: Transcode BC→ASTC if destination is ASTC (PanVK detected)
+    if (util::isBcFormat(packedFormat)
+        && m_device->GetDXVKDevice()->adapter()->isPanVk()) {
+      auto srcExtent = pDstTexture->MipLevelExtent(
+        pDstTexture->GetSubresourceFromIndex(
+          imageFormatInfo(packedFormat)->aspectMask, DstSubresource).mipLevel);
+
+      std::vector<uint8_t> astcData = util::transcodeBcToAstc(
+        pSrcData, packedFormat,
+        srcExtent.width, srcExtent.height,
+        SrcRowPitch);
+
+      if (!astcData.empty()) {
+        VkFormat astcFormat = util::bcToAstcFormat(packedFormat);
+        UpdateTexture(pDstTexture, DstSubresource, pDstBox,
+          astcData.data(), srcExtent.width * 4, 0);
+        return;
+      }
+    }
 
     auto formatInfo = imageFormatInfo(packedFormat);
     auto subresource = pDstTexture->GetSubresourceFromIndex(
