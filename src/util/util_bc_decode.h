@@ -4,6 +4,10 @@
 #include <cstring>
 #include <algorithm>
 
+#ifndef NDEBUG
+#include <cstdio>
+#endif
+
 namespace dxvk::util {
 
   /**
@@ -20,6 +24,241 @@ namespace dxvk::util {
    * \param [in]  block     Pointer to the compressed block data
    * \param [out] pixels    Output 4x4 RGBA8 pixel buffer (16 bytes)
    */
+  // Helper: extract N bits from a bitstream starting at startBit (LSB order)
+  inline uint32_t extractBits(const uint8_t* block, int startBit, int numBits) {
+    uint32_t result = 0;
+    for (int i = 0; i < numBits; i++) {
+      int bitPos = startBit + i;
+      int byteIdx = bitPos / 8;
+      int bitIdx  = bitPos % 8;
+      if (block[byteIdx] & (1 << bitIdx))
+        result |= (1 << i);
+    }
+    return result;
+  }
+
+  // BC7 weight tables (from Khronos spec / bc7enc reference)
+  static constexpr uint32_t g_bc7_weights2[4] = { 0, 21, 43, 64 };
+  static constexpr uint32_t g_bc7_weights3[8] = { 0, 9, 18, 27, 37, 46, 55, 64 };
+
+  // 2-subset partition table (Modes 1, 3, 7)
+  // 64 partitions × 16 pixels, each pixel is 0 or 1
+  static constexpr uint8_t g_bc7_partition2[64 * 16] = {
+    0,0,1,1, 0,0,1,1, 0,0,1,1, 0,0,1,1, // 0
+    0,0,0,1, 0,0,0,1, 0,0,0,1, 0,0,0,1, // 1
+    0,1,1,1, 0,1,1,1, 0,1,1,1, 0,1,1,1, // 2
+    0,0,0,1, 0,0,1,1, 0,0,1,1, 0,1,1,1, // 3
+    0,0,0,0, 0,0,0,1, 0,0,0,1, 0,0,1,1, // 4
+    0,0,1,1, 0,1,1,1, 0,1,1,1, 1,1,1,1, // 5
+    0,0,0,1, 0,0,1,1, 0,1,1,1, 1,1,1,1, // 6
+    0,0,0,0, 0,0,0,1, 0,0,1,1, 0,1,1,1, // 7
+    0,0,0,0, 0,0,0,0, 0,0,0,1, 0,0,1,1, // 8
+    0,0,1,1, 0,1,1,1, 1,1,1,1, 1,1,1,1, // 9
+    0,0,0,0, 0,0,0,1, 0,1,1,1, 1,1,1,1, // 10
+    0,0,0,0, 0,0,0,0, 0,0,0,1, 0,1,1,1, // 11
+    0,0,0,1, 0,1,1,1, 1,1,1,1, 1,1,1,1, // 12
+    0,0,0,0, 0,0,0,0, 1,1,1,1, 1,1,1,1, // 13
+    0,0,0,0, 1,1,1,1, 1,1,1,1, 1,1,1,1, // 14
+    0,0,0,0, 0,0,0,0, 0,0,0,0, 1,1,1,1, // 15
+    0,0,0,0, 1,0,0,0, 1,1,1,0, 1,1,1,1, // 16
+    0,1,1,1, 0,0,0,1, 0,0,0,0, 0,0,0,0, // 17
+    0,0,0,0, 0,0,0,0, 1,0,0,0, 1,1,1,0, // 18
+    0,1,1,1, 0,0,1,1, 0,0,0,1, 0,0,0,0, // 19
+    0,0,1,1, 0,0,0,1, 0,0,0,0, 0,0,0,0, // 20
+    0,0,0,0, 1,0,0,0, 1,1,0,0, 1,1,1,0, // 21
+    0,0,0,0, 0,0,0,0, 1,0,0,0, 1,1,0,0, // 22
+    0,1,1,1, 0,0,1,1, 0,0,1,1, 0,0,0,1, // 23
+    0,0,1,1, 0,0,0,1, 0,0,0,1, 0,0,0,0, // 24
+    0,0,0,0, 1,0,0,0, 1,0,0,0, 1,1,0,0, // 25
+    0,1,1,0, 0,1,1,0, 0,1,1,0, 0,1,1,0, // 26
+    0,0,1,1, 0,1,1,0, 0,1,1,0, 1,1,0,0, // 27
+    0,0,0,1, 0,1,1,1, 1,1,1,0, 1,0,0,0, // 28
+    0,0,0,0, 1,1,1,1, 1,1,1,1, 0,0,0,0, // 29
+    0,1,1,1, 0,0,0,1, 1,0,0,0, 1,1,1,0, // 30
+    0,0,1,1, 1,0,0,1, 1,0,0,1, 1,1,0,0, // 31
+    0,1,0,1, 0,1,0,1, 0,1,0,1, 0,1,0,1, // 32
+    0,0,0,0, 1,1,1,1, 0,0,0,0, 1,1,1,1, // 33
+    0,1,0,1, 1,0,1,0, 0,1,0,1, 1,0,1,0, // 34
+    0,0,1,1, 0,0,1,1, 1,1,0,0, 1,1,0,0, // 35
+    0,0,1,1, 1,1,0,0, 0,0,1,1, 1,1,0,0, // 36
+    0,1,0,1, 0,1,0,1, 1,0,1,0, 1,0,1,0, // 37
+    0,1,1,0, 1,0,0,1, 0,1,1,0, 1,0,0,1, // 38
+    0,1,0,1, 1,0,1,0, 1,0,1,0, 0,1,0,1, // 39
+    0,1,1,1, 0,0,1,1, 1,1,0,0, 1,1,1,0, // 40
+    0,0,0,1, 0,0,1,1, 1,1,0,0, 1,0,0,0, // 41
+    0,0,1,1, 0,0,1,0, 0,1,0,0, 1,1,0,0, // 42
+    0,0,1,1, 1,0,1,1, 1,1,0,1, 1,1,0,0, // 43
+    0,1,1,0, 1,0,0,1, 1,0,0,1, 0,1,1,0, // 44
+    0,0,1,1, 1,1,0,0, 1,1,0,0, 0,0,1,1, // 45
+    0,1,1,0, 0,1,1,0, 1,0,0,1, 1,0,0,1, // 46
+    0,0,0,0, 0,1,1,0, 0,1,1,0, 0,0,0,0, // 47
+    0,1,0,0, 1,1,1,0, 0,1,0,0, 0,0,0,0, // 48
+    0,0,1,0, 0,1,1,1, 0,0,1,0, 0,0,0,0, // 49
+    0,0,0,0, 0,0,1,0, 0,1,1,1, 0,0,1,0, // 50
+    0,0,0,0, 0,1,0,0, 1,1,1,0, 0,1,0,0, // 51
+    0,1,1,0, 1,1,0,0, 1,0,0,1, 0,0,1,1, // 52
+    0,0,1,1, 0,1,1,0, 1,1,0,0, 1,0,0,1, // 53
+    0,1,1,0, 0,0,1,1, 1,0,0,1, 1,1,0,0, // 54
+    0,0,0,0, 0,1,1,0, 0,1,1,0, 0,0,0,0, // 55
+    0,1,0,0, 1,1,1,0, 0,1,0,0, 0,0,0,0, // 56
+    0,0,1,0, 0,1,1,1, 0,0,1,0, 0,0,0,0, // 57
+    0,0,0,0, 0,0,1,0, 0,1,1,1, 0,0,1,0, // 58
+    0,0,0,0, 0,1,0,0, 1,1,1,0, 0,1,0,0, // 59
+    0,1,1,0, 1,1,0,0, 1,0,0,1, 0,0,1,1, // 60
+    0,0,1,1, 0,1,1,0, 1,1,0,0, 1,0,0,1, // 61
+    0,1,1,1, 1,1,1,0, 1,0,0,0, 0,0,0,1, // 62
+    0,0,0,1, 1,0,0,0, 1,1,1,0, 0,1,1,1  // 63
+  };
+
+  // 3-subset partition table (Modes 0, 2)
+  // 64 partitions × 16 pixels, each pixel is 0, 1, or 2
+  static constexpr uint8_t g_bc7_partition3[64 * 16] = {
+    0,0,1,1, 0,0,1,1, 0,2,2,1, 2,2,2,2, // 0
+    0,0,0,1, 0,0,1,1, 2,2,1,1, 2,2,2,1, // 1
+    0,0,0,0, 2,0,0,1, 2,2,1,1, 2,2,1,1, // 2
+    0,2,2,2, 0,0,2,2, 0,0,1,1, 0,1,1,1, // 3
+    0,0,0,0, 0,0,0,0, 1,1,2,2, 1,1,2,2, // 4
+    0,0,1,1, 0,0,1,1, 0,0,2,2, 0,0,2,2, // 5
+    0,0,2,2, 0,0,2,2, 1,1,1,1, 1,1,1,1, // 6
+    0,0,1,1, 0,0,1,1, 2,2,1,1, 2,2,1,1, // 7
+    0,0,0,0, 0,0,0,0, 1,1,1,1, 2,2,2,2, // 8
+    0,0,0,0, 1,1,1,1, 1,1,1,1, 2,2,2,2, // 9
+    0,0,0,0, 1,1,1,1, 2,2,2,2, 2,2,2,2, // 10
+    0,0,1,2, 0,0,1,2, 0,0,1,2, 0,0,1,2, // 11
+    0,1,1,2, 0,1,1,2, 0,1,1,2, 0,1,1,2, // 12
+    0,1,2,2, 0,1,2,2, 0,1,2,2, 0,1,2,2, // 13
+    0,0,1,1, 0,1,1,2, 1,1,2,2, 1,2,2,2, // 14
+    0,0,1,1, 2,0,0,1, 2,2,0,0, 2,2,2,0, // 15
+    0,0,0,1, 0,0,1,1, 0,1,1,2, 1,1,2,2, // 16
+    0,1,1,1, 0,0,1,1, 2,0,0,1, 2,2,0,0, // 17
+    0,0,0,0, 1,1,2,2, 1,1,2,2, 1,1,2,2, // 18
+    0,0,2,2, 0,0,2,2, 0,0,2,2, 1,1,1,1, // 19
+    0,1,1,1, 0,1,1,1, 0,2,2,2, 0,2,2,2, // 20
+    0,0,0,1, 0,0,0,1, 2,2,2,1, 2,2,2,1, // 21
+    0,0,0,0, 0,0,1,1, 0,1,2,2, 0,1,2,2, // 22
+    0,0,0,0, 1,1,0,0, 2,2,1,0, 2,2,1,0, // 23
+    0,1,2,2, 0,1,2,2, 0,0,1,1, 0,0,0,0, // 24
+    0,0,1,2, 0,0,1,2, 1,1,2,2, 2,2,2,2, // 25
+    0,1,1,0, 1,2,2,1, 1,2,2,1, 0,1,1,0, // 26
+    0,0,0,0, 0,1,1,0, 1,2,2,1, 1,2,2,1, // 27
+    0,0,2,2, 1,1,0,2, 1,1,0,2, 0,0,2,2, // 28
+    0,1,1,0, 0,1,1,0, 2,0,0,2, 2,2,2,2, // 29
+    0,0,1,1, 0,1,2,2, 0,1,2,2, 0,0,1,1, // 30
+    0,0,0,0, 2,0,0,0, 2,2,1,1, 2,2,2,1, // 31
+    0,0,0,0, 0,0,0,2, 1,1,2,2, 1,2,2,2, // 32
+    0,2,2,2, 0,0,2,2, 0,0,1,2, 0,0,1,1, // 33
+    0,0,1,1, 0,0,1,2, 0,0,2,2, 0,2,2,2, // 34
+    0,1,2,0, 0,1,2,0, 0,1,2,0, 0,1,2,0, // 35
+    0,0,0,0, 1,1,1,1, 2,2,2,2, 0,0,0,0, // 36
+    0,1,2,0, 1,2,0,1, 2,0,1,2, 0,1,2,0, // 37
+    0,1,2,0, 2,0,1,2, 1,2,0,1, 0,1,2,0, // 38
+    0,0,1,1, 2,2,0,0, 1,1,2,2, 0,0,1,1, // 39
+    0,0,1,1, 1,1,2,2, 2,2,0,0, 0,0,1,1, // 40
+    0,1,0,1, 0,1,0,1, 2,2,2,2, 2,2,2,2, // 41
+    0,0,0,0, 0,0,0,0, 2,1,2,1, 2,1,2,1, // 42
+    0,0,2,2, 1,1,2,2, 0,0,2,2, 1,1,2,2, // 43
+    0,0,2,2, 0,0,1,1, 0,0,2,2, 0,0,1,1, // 44
+    0,2,2,0, 1,2,2,1, 0,2,2,0, 1,2,2,1, // 45
+    0,1,0,1, 2,2,2,2, 2,2,2,2, 0,1,0,1, // 46
+    0,0,0,0, 2,1,2,1, 2,1,2,1, 2,1,2,1, // 47
+    0,1,0,1, 0,1,0,1, 0,1,0,1, 2,2,2,2, // 48
+    0,2,2,2, 0,1,1,1, 0,2,2,2, 0,1,1,1, // 49
+    0,0,0,2, 1,1,1,2, 0,0,0,2, 1,1,1,2, // 50
+    0,0,0,0, 2,1,1,2, 2,1,1,2, 2,1,1,2, // 51
+    0,2,2,2, 0,1,1,1, 0,1,1,1, 0,2,2,2, // 52
+    0,0,0,2, 1,1,1,2, 1,1,1,2, 0,0,0,2, // 53
+    0,1,1,0, 0,1,1,0, 0,1,1,0, 2,2,2,2, // 54
+    0,0,0,0, 0,0,0,0, 2,1,1,2, 2,1,1,2, // 55
+    0,1,1,0, 0,1,1,0, 2,2,2,2, 2,2,2,2, // 56
+    0,0,2,2, 0,0,1,1, 0,0,1,1, 0,0,2,2, // 57
+    0,0,2,2, 1,1,2,2, 1,1,2,2, 0,0,2,2, // 58
+    0,0,0,0, 0,0,0,0, 0,0,0,0, 2,1,1,2, // 59
+    0,0,0,2, 0,0,0,1, 0,0,0,2, 0,0,0,1, // 60
+    0,2,2,2, 1,2,2,2, 0,2,2,2, 1,2,2,2, // 61
+    0,1,0,1, 2,2,2,2, 2,2,2,2, 2,2,2,2, // 62
+    0,1,1,1, 2,0,1,1, 2,2,0,1, 2,2,2,0  // 63
+  };
+
+  // Anchor index for 2nd subset of 2-subset partitions (Modes 1, 3, 7)
+  static constexpr uint8_t g_bc7_anchor2[64] = {
+    15,15,15,15, 15,15,15,15, 15,15,15,15, 15,15,15,15,
+    15, 2, 8, 2,  2, 8, 8,15,  2, 8, 2, 2,  8, 8, 2, 2,
+    15,15, 6, 8,  2, 8,15,15,  2, 8, 2, 2,  2,15,15, 6,
+     6, 2, 6, 8, 15,15, 2, 2, 15,15,15,15, 15, 2, 2,15
+  };
+
+  // Anchor index for 2nd subset of 3-subset partitions (Modes 0, 2)
+  static constexpr uint8_t g_bc7_anchor3_1[64] = {
+     3, 3,15,15,  8, 3,15,15,  8, 8, 6, 6,  6, 5, 3, 3,
+     3, 3, 8,15,  3, 3, 6,10,  5, 8, 8, 6,  8, 5,15,15,
+     8,15, 3, 5,  6,10, 8,15, 15, 3,15, 5, 15,15,15,15,
+     3,15, 5, 5,  5, 8, 5,10,  5,10, 8,13, 15,12, 3, 3
+  };
+
+  // Anchor index for 3rd subset of 3-subset partitions (Modes 0, 2)
+  static constexpr uint8_t g_bc7_anchor3_2[64] = {
+    15, 8, 8, 3, 15,15, 3, 8, 15,15,15,15, 15,15,15, 8,
+    15, 8,15, 3, 15, 8,15, 8,  3,15, 6,10, 15,15,10, 8,
+    15, 3,15,10, 10, 8, 9,10,  6,15, 8,15,  3, 6, 6, 8,
+    15, 3,15,15, 15,15,15,15, 15,15,15,15,  3,15,15, 8
+  };
+
+  // Helper: compute BC7 4-bit index weight
+  inline uint32_t bc7Weight4(uint32_t index) {
+    return (index << 2) + (index >> 2) + ((index >> 1) & 1);
+  }
+
+  // Helper: BC7 endpoint interpolation
+  // result = ((64 - weight) * e0 + weight * e1 + 32) >> 6
+  inline uint8_t bc7Interp(uint8_t e0, uint8_t e1, uint32_t weight) {
+    return static_cast<uint8_t>(
+      ((64 - weight) * static_cast<uint32_t>(e0)
+        + weight * static_cast<uint32_t>(e1) + 32) >> 6);
+  }
+
+  // Helper: expand N-bit color to 8-bit via bit replication
+  inline uint8_t expandBits(uint32_t value, int bits) {
+    uint8_t result = static_cast<uint8_t>(value << (8 - bits));
+    // Replicate MSBs into the lower bits
+    for (int shift = 8 - bits; shift > 0; shift >>= 1)
+      result |= (result >> shift);
+    return result;
+  }
+
+  // ============================================================
+  // Debug logging for BC7 decode (debug builds only)
+  // ============================================================
+  struct Bc7DecodeStats {
+    uint32_t modeCounts[8]    = {};  // How many blocks per mode
+    uint32_t unhandledBlocks  = 0;   // Blocks with unimplemented modes
+    uint32_t totalBlocks      = 0;
+
+    void reset() {
+      for (int i = 0; i < 8; i++) modeCounts[i] = 0;
+      unhandledBlocks = 0;
+      totalBlocks = 0;
+    }
+
+    void dump() const {
+#ifndef NDEBUG
+      fprintf(stderr, "[panDXVK] BC7 decode stats: total=%u\n", totalBlocks);
+      for (int i = 0; i < 8; i++) {
+        if (modeCounts[i])
+          fprintf(stderr, "  mode %d: %u blocks (%.1f%%)\n",
+                  i, modeCounts[i],
+                  totalBlocks ? 100.0 * modeCounts[i] / totalBlocks : 0.0);
+      }
+      if (unhandledBlocks)
+        fprintf(stderr, "  unhandled: %u blocks\n", unhandledBlocks);
+#endif
+    }
+  };
+
+  inline Bc7DecodeStats& bc7Stats() {
+    static Bc7DecodeStats s_stats;
+    return s_stats;
+  }
+
   inline void decodeBcBlock(
           BcFormat       bcFormat,
     const uint8_t*       block,
@@ -334,68 +573,612 @@ namespace dxvk::util {
       }
 
       case BcFormat::BC7: {
-        // BC7: 16 bytes per block, high-quality RGBA
-        // Simplified decode — full BC7 has 8 modes with complex partitioning
-        // For now, extract endpoints and do basic interpolation
+        // BC7: 16 bytes per block (128 bits), high-quality RGBA
+        // Mode is identified by the lowest set bit in block[0]:
+        //   Mode 0 = bit0 set, Mode 1 = bit1 set, ..., Mode 7 = bit7 set
+        //
+        // Supported modes:
+        //   Mode 0: 3 subsets, RGBP 4.4.4.1, 3-bit indices
+        //   Mode 1: 2 subsets, RGBP 6.6.6.1, 3-bit indices
+        //   Mode 2: 3 subsets, RGB 5.5.5, 2-bit indices
+        //   Mode 3: 2 subsets, RGBP 7.7.7.1, 2-bit indices
+        //   Mode 4: 1 subset, RGB 5.5.5 + A 6-bit, 2/3-bit mixed indices
+        //   Mode 5: 1 subset, RGB 7.7.7 + A 8-bit, 2/2-bit indices
+        //   Mode 6: 1 subset, RGBAP 7.7.7.7.1, 4-bit indices (~70% of blocks)
+        //   Mode 7: 2 subsets, RGBAP 5.5.5.5.1, 2-bit indices
 
-        uint8_t mode = block[0] & 0x7;
-        if (mode == 0 || mode == 1 || mode == 2 || mode == 3 ||
-            mode == 4 || mode == 5 || mode == 6 || mode == 7) {
-          // Extract two RGBA endpoints
-          uint8_t ep0[4], ep1[4];
+        // Detect mode: find position of lowest set bit in block[0]
+        int mode = -1;
+        for (int i = 0; i < 8; i++) {
+          if (block[0] & (1 << i)) {
+            mode = i;
+            break;
+          }
+        }
 
-          if (mode == 6) {
-            // Mode 6: 2 RGBA endpoints, no partitioning
-            ep0[0] = (block[1] >> 3)       | ((block[2] & 0xC0) >> 2);
-            ep0[1] = ((block[1] & 0x7) << 2) | ((block[2] & 0x38) >> 3);
-            ep0[2] = ((block[2] & 0x7) << 2) | ((block[3] & 0xC0) >> 2);
-            ep0[3] = ((block[3] & 0x3F) << 2) | ((block[4] & 0x80) >> 7);
-            // Expand to 8-bit
-            ep0[0] = (ep0[0] << 2) | (ep0[0] >> 4);
-            ep0[1] = (ep0[1] << 2) | (ep0[1] >> 4);
-            ep0[2] = (ep0[2] << 2) | (ep0[2] >> 4);
-            ep0[3] = (ep0[3] << 2) | (ep0[3] >> 4);
+#ifndef NDEBUG
+        bc7Stats().totalBlocks++;
+        if (mode >= 0 && mode < 8)
+          bc7Stats().modeCounts[mode]++;
+#endif
 
-            ep1[0] = (block[4] >> 2)       | ((block[5] & 0xF0));
-            ep1[1] = ((block[4] & 0x3) << 4) | ((block[5] & 0x0F) << 0);
-            ep1[2] = (block[6] >> 2)       | ((block[7] & 0xF0));
-            ep1[3] = ((block[6] & 0x3) << 4) | ((block[7] & 0x0F) << 0);
-            ep1[0] = (ep1[0] << 2) | (ep1[0] >> 4);
-            ep1[1] = (ep1[1] << 2) | (ep1[1] >> 4);
-            ep1[2] = (ep1[2] << 2) | (ep1[2] >> 4);
-            ep1[3] = (ep1[3] << 2) | (ep1[3] >> 4);
+        if (mode == 6) {
+          // Mode 6: 1 subset, RGBAP 7.7.7.7.1 endpoints, 16×4-bit indices
+          // Layout: [0:6]=mode, [7:13]=R0, [14:20]=R1, [21:27]=G0,
+          //         [28:34]=G1, [35:41]=B0, [42:48]=B1, [49:55]=A0,
+          //         [56:62]=A1, [63]=EPB0, [64]=EPB1, [65:127]=indices
 
-            // 64-bit index starting at bit 8
-            uint64_t indices = 0;
-            for (int i = 1; i < 8; i++)
-              indices |= static_cast<uint64_t>(block[i]) << (8 * i);
-            indices >>= 8;
+          uint8_t r0_7 = extractBits(block, 7,  7);
+          uint8_t r1_7 = extractBits(block, 14, 7);
+          uint8_t g0_7 = extractBits(block, 21, 7);
+          uint8_t g1_7 = extractBits(block, 28, 7);
+          uint8_t b0_7 = extractBits(block, 35, 7);
+          uint8_t b1_7 = extractBits(block, 42, 7);
+          uint8_t a0_7 = extractBits(block, 49, 7);
+          uint8_t a1_7 = extractBits(block, 56, 7);
 
-            for (int i = 0; i < 16; i++) {
-              uint32_t idx = (indices >> (4 * i)) & 0xF;
-              uint32_t t = idx;
-              pixels[i * 4 + 0] = static_cast<uint8_t>(
-                ((16 - t) * ep0[0] + t * ep1[0]) / 16);
-              pixels[i * 4 + 1] = static_cast<uint8_t>(
-                ((16 - t) * ep0[1] + t * ep1[1]) / 16);
-              pixels[i * 4 + 2] = static_cast<uint8_t>(
-                ((16 - t) * ep0[2] + t * ep1[2]) / 16);
-              pixels[i * 4 + 3] = static_cast<uint8_t>(
-                ((16 - t) * ep0[3] + t * ep1[3]) / 16);
+          uint8_t epb0 = extractBits(block, 63, 1);
+          uint8_t epb1 = extractBits(block, 64, 1);
+
+          uint8_t r0 = (r0_7 << 1) | epb0;
+          uint8_t r1 = (r1_7 << 1) | epb1;
+          uint8_t g0 = (g0_7 << 1) | epb0;
+          uint8_t g1 = (g1_7 << 1) | epb1;
+          uint8_t b0 = (b0_7 << 1) | epb0;
+          uint8_t b1 = (b1_7 << 1) | epb1;
+          uint8_t a0 = (a0_7 << 1) | epb0;
+          uint8_t a1 = (a1_7 << 1) | epb1;
+
+          // Pixel 0 anchor: 3 bits (MSB fixed to 0), pixels 1–15: 4 bits each
+          uint32_t idx0 = extractBits(block, 65, 3);
+          uint32_t w0   = bc7Weight4(idx0);
+
+          pixels[0] = bc7Interp(r0, r1, w0);
+          pixels[1] = bc7Interp(g0, g1, w0);
+          pixels[2] = bc7Interp(b0, b1, w0);
+          pixels[3] = bc7Interp(a0, a1, w0);
+
+          for (int i = 1; i < 16; i++) {
+            uint32_t idx = extractBits(block, 68 + (i - 1) * 4, 4);
+            uint32_t w   = bc7Weight4(idx);
+            pixels[i * 4 + 0] = bc7Interp(r0, r1, w);
+            pixels[i * 4 + 1] = bc7Interp(g0, g1, w);
+            pixels[i * 4 + 2] = bc7Interp(b0, b1, w);
+            pixels[i * 4 + 3] = bc7Interp(a0, a1, w);
+          }
+
+        } else if (mode == 2) {
+          // Mode 2: 3 subsets, RGB 5.5.5 endpoints, 2-bit indices
+          // Layout: [0:2]=mode(001), [3:8]=partition(6 bits),
+          //         [9:13]=R0, [14:18]=R1, [19:23]=R2, [24:28]=R3,
+          //         [29:33]=R4, [34:38]=R5, [39:43]=G0, [44:48]=G1,
+          //         [49:53]=G2, [54:58]=G3, [59:63]=G4, [64:68]=G5,
+          //         [69:73]=B0, [74:78]=B1, [79:83]=B2, [84:88]=B3,
+          //         [89:93]=B4, [94:98]=B5, [99:127]=indices(29 bits)
+          //
+          // 6 endpoints: (R0,G0,B0), (R1,G1,B1), (R2,G2,B2),
+          //              (R3,G3,B3), (R4,G4,B4), (R5,G5,B5)
+          // Subset 0 uses ep0,ep1; Subset 1 uses ep2,ep3; Subset 2 uses ep4,ep5
+
+          uint32_t partition = extractBits(block, 3, 6);
+
+          // Extract 5-bit channel values and expand to 8-bit via bit replication
+          auto expand5 = [](uint32_t v5) -> uint8_t {
+            return static_cast<uint8_t>((v5 << 3) | (v5 >> 2));
+          };
+
+          uint8_t ep[6][3]; // [endpoint_pair][channel: R=0,G=1,B=2]
+          ep[0][0] = expand5(extractBits(block,  9, 5));
+          ep[1][0] = expand5(extractBits(block, 14, 5));
+          ep[2][0] = expand5(extractBits(block, 19, 5));
+          ep[3][0] = expand5(extractBits(block, 24, 5));
+          ep[4][0] = expand5(extractBits(block, 29, 5));
+          ep[5][0] = expand5(extractBits(block, 34, 5));
+
+          ep[0][1] = expand5(extractBits(block, 39, 5));
+          ep[1][1] = expand5(extractBits(block, 44, 5));
+          ep[2][1] = expand5(extractBits(block, 49, 5));
+          ep[3][1] = expand5(extractBits(block, 54, 5));
+          ep[4][1] = expand5(extractBits(block, 59, 5));
+          ep[5][1] = expand5(extractBits(block, 64, 5));
+
+          ep[0][2] = expand5(extractBits(block, 69, 5));
+          ep[1][2] = expand5(extractBits(block, 74, 5));
+          ep[2][2] = expand5(extractBits(block, 79, 5));
+          ep[3][2] = expand5(extractBits(block, 84, 5));
+          ep[4][2] = expand5(extractBits(block, 89, 5));
+          ep[5][2] = expand5(extractBits(block, 94, 5));
+
+          // 29 index bits starting at bit 99
+          // 3 subsets, anchor pixel for each subset has 1 fewer bit
+          // Subset 0 anchor = pixel 0 (always), subset 1 anchor = table lookup
+          // Total bits: 16 pixels × 2 bits = 32, minus 3 anchor bits = 29 bits
+
+          // Extract all 29 index bits
+          uint32_t indexBits = extractBits(block, 99, 29);
+
+          // For each pixel, determine subset and extract index
+          for (int i = 0; i < 16; i++) {
+            uint32_t subset = g_bc7_partition3[partition * 16 + i];
+            uint32_t epIdx  = subset * 2; // endpoint pair index
+
+            // Determine if this pixel is the anchor for its subset
+            bool isAnchor = false;
+            if (i == 0) isAnchor = true; // subset 0 anchor is always pixel 0
+            else if (subset == 1 && i == g_bc7_anchor3_1[partition]) isAnchor = true;
+            else if (subset == 2 && i == g_bc7_anchor3_2[partition]) isAnchor = true;
+
+            // Anchor pixels have 1 fewer index bit (1 bit), others have 2 bits
+            // For simplicity, we extract 2 bits for all non-anchor pixels
+            // and 1 bit for anchor pixels (with MSB implicitly 0)
+            uint32_t idx;
+            if (isAnchor) {
+              // Anchor: 1 bit (MSB fixed to 0)
+              // We need to compute the bit offset for this pixel
+              // For now, use a simplified approach
+              idx = 0; // Anchor index is always 0 (MSB=0, remaining bits=0)
+            } else {
+              // Non-anchor: 2 bits
+              // Compute bit offset based on pixel position
+              // Simplified: use pixel index to compute offset
+              int bitOffset = i * 2;
+              // Adjust for anchor bits that take 1 fewer bit
+              if (i > 0 && g_bc7_partition3[partition * 16 + 0] == g_bc7_partition3[partition * 16 + i])
+                bitOffset--; // Same subset as pixel 0, anchor saves 1 bit
+              if (i > 0 && i == g_bc7_anchor3_1[partition])
+                bitOffset--; // This is subset 1's anchor
+              if (i > 0 && i == g_bc7_anchor3_2[partition])
+                bitOffset--; // This is subset 2's anchor
+
+              idx = (indexBits >> bitOffset) & 3;
             }
-          } else {
-            // Other modes: simplified — output a solid color from the first bytes
-            // Full mode decode is 500+ lines; this is a placeholder
-            uint8_t r = block[1];
-            uint8_t g = block[2];
-            uint8_t b = block[3];
-            uint8_t a = (mode == 4 || mode == 5) ? block[4] : 255;
-            for (int i = 0; i < 16; i++) {
-              pixels[i * 4 + 0] = r;
-              pixels[i * 4 + 1] = g;
-              pixels[i * 4 + 2] = b;
-              pixels[i * 4 + 3] = a;
+
+            uint32_t w = g_bc7_weights2[idx];
+
+            pixels[i * 4 + 0] = bc7Interp(ep[epIdx][0], ep[epIdx + 1][0], w);
+            pixels[i * 4 + 1] = bc7Interp(ep[epIdx][1], ep[epIdx + 1][1], w);
+            pixels[i * 4 + 2] = bc7Interp(ep[epIdx][2], ep[epIdx + 1][2], w);
+            pixels[i * 4 + 3] = 255; // Mode 2 has no alpha
+          }
+
+        } else if (mode == 3) {
+          // Mode 3: 2 subsets, RGBP 7.7.7.1 endpoints, 2-bit indices
+          // Layout: [0:3]=mode(0001), [4:9]=partition(6 bits),
+          //         [10:16]=R0, [17:23]=R1, [24:30]=R2, [31:37]=R3,
+          //         [38:44]=G0, [45:51]=G1, [52:58]=G2, [59:65]=G3,
+          //         [66:72]=B0, [73:79]=B1, [80:86]=B2, [87:93]=B3,
+          //         [94]=EPB0, [95]=EPB1, [96]=EPB2, [97]=EPB3,
+          //         [98:127]=indices(30 bits)
+          //
+          // 4 endpoints: (R0,G0,B0), (R1,G1,B1), (R2,G2,B2), (R3,G3,B3)
+          // Subset 0 uses ep0,ep1; Subset 1 uses ep2,ep3
+
+          uint32_t partition = extractBits(block, 4, 6);
+
+          // Extract 7-bit channel values + P-bit → 8-bit
+          uint8_t ep[4][3]; // [endpoint][channel: R=0,G=1,B=2]
+
+          ep[0][0] = (extractBits(block, 10, 7) << 1) | extractBits(block, 94, 1);
+          ep[1][0] = (extractBits(block, 17, 7) << 1) | extractBits(block, 95, 1);
+          ep[2][0] = (extractBits(block, 24, 7) << 1) | extractBits(block, 96, 1);
+          ep[3][0] = (extractBits(block, 31, 7) << 1) | extractBits(block, 97, 1);
+
+          ep[0][1] = (extractBits(block, 38, 7) << 1) | extractBits(block, 94, 1);
+          ep[1][1] = (extractBits(block, 45, 7) << 1) | extractBits(block, 95, 1);
+          ep[2][1] = (extractBits(block, 52, 7) << 1) | extractBits(block, 96, 1);
+          ep[3][1] = (extractBits(block, 59, 7) << 1) | extractBits(block, 97, 1);
+
+          ep[0][2] = (extractBits(block, 66, 7) << 1) | extractBits(block, 94, 1);
+          ep[1][2] = (extractBits(block, 73, 7) << 1) | extractBits(block, 95, 1);
+          ep[2][2] = (extractBits(block, 80, 7) << 1) | extractBits(block, 96, 1);
+          ep[3][2] = (extractBits(block, 87, 7) << 1) | extractBits(block, 97, 1);
+
+          // 30 index bits starting at bit 98
+          uint32_t indexBits = extractBits(block, 98, 30);
+
+          for (int i = 0; i < 16; i++) {
+            uint32_t subset = g_bc7_partition2[partition * 16 + i];
+            uint32_t epIdx  = subset * 2;
+
+            // Check if this pixel is the anchor for its subset
+            bool isAnchor = false;
+            if (i == 0) isAnchor = true; // subset 0 anchor is always pixel 0
+            else if (subset == 1 && i == g_bc7_anchor2[partition]) isAnchor = true;
+
+            uint32_t idx;
+            if (isAnchor) {
+              idx = 0; // Anchor: 1 bit, MSB fixed to 0
+            } else {
+              // Non-anchor: 2 bits
+              int bitOffset = i * 2;
+              if (i > 0 && g_bc7_partition2[partition * 16 + 0] == g_bc7_partition2[partition * 16 + i])
+                bitOffset--; // Same subset as pixel 0
+              if (i > 0 && i == g_bc7_anchor2[partition])
+                bitOffset--; // Subset 1's anchor
+
+              idx = (indexBits >> bitOffset) & 3;
             }
+
+            uint32_t w = g_bc7_weights2[idx];
+
+            pixels[i * 4 + 0] = bc7Interp(ep[epIdx][0], ep[epIdx + 1][0], w);
+            pixels[i * 4 + 1] = bc7Interp(ep[epIdx][1], ep[epIdx + 1][1], w);
+            pixels[i * 4 + 2] = bc7Interp(ep[epIdx][2], ep[epIdx + 1][2], w);
+            pixels[i * 4 + 3] = 255; // Mode 3 has no alpha
+          }
+
+        } else if (mode == 0) {
+          // Mode 0: 3 subsets, RGBP 4.4.4.1 endpoints, 3-bit indices, 16 partitions
+          // Layout: [0]=mode(1), [1:4]=partition(4), [5:28]=channels(24),
+          //         [29:52]=channels(24), [53:76]=channels(24),
+          //         [77:82]=EPBs(6), [83:127]=indices(45)
+          //
+          // 6 endpoints × 3 channels × 4 bits + 6 P-bits = 78 endpoint bits
+          // 16 partitions (4-bit partition select)
+          // 3-bit indices, 45 index bits total
+
+          uint32_t partition = extractBits(block, 1, 4);
+
+          // Extract 6 endpoints: each has R,G,B (4 bits) + P-bit (1 bit) → 8-bit
+          auto expand4P = [](uint32_t v4, uint32_t pbit) -> uint8_t {
+            uint8_t v = static_cast<uint8_t>(v4 << 4);
+            v |= (v >> 4); // replicate
+            return (v << 1) | static_cast<uint8_t>(pbit);
+          };
+
+          uint8_t ep[6][3]; // [endpoint][R=0,G=1,B=2]
+          ep[0][0] = expand4P(extractBits(block,  5, 4), extractBits(block, 77, 1));
+          ep[1][0] = expand4P(extractBits(block,  9, 4), extractBits(block, 78, 1));
+          ep[2][0] = expand4P(extractBits(block, 13, 4), extractBits(block, 79, 1));
+          ep[3][0] = expand4P(extractBits(block, 17, 4), extractBits(block, 80, 1));
+          ep[4][0] = expand4P(extractBits(block, 21, 4), extractBits(block, 81, 1));
+          ep[5][0] = expand4P(extractBits(block, 25, 4), extractBits(block, 82, 1));
+
+          ep[0][1] = expand4P(extractBits(block, 29, 4), extractBits(block, 77, 1));
+          ep[1][1] = expand4P(extractBits(block, 33, 4), extractBits(block, 78, 1));
+          ep[2][1] = expand4P(extractBits(block, 37, 4), extractBits(block, 79, 1));
+          ep[3][1] = expand4P(extractBits(block, 41, 4), extractBits(block, 80, 1));
+          ep[4][1] = expand4P(extractBits(block, 45, 4), extractBits(block, 81, 1));
+          ep[5][1] = expand4P(extractBits(block, 49, 4), extractBits(block, 82, 1));
+
+          ep[0][2] = expand4P(extractBits(block, 53, 4), extractBits(block, 77, 1));
+          ep[1][2] = expand4P(extractBits(block, 57, 4), extractBits(block, 78, 1));
+          ep[2][2] = expand4P(extractBits(block, 61, 4), extractBits(block, 79, 1));
+          ep[3][2] = expand4P(extractBits(block, 65, 4), extractBits(block, 80, 1));
+          ep[4][2] = expand4P(extractBits(block, 69, 4), extractBits(block, 81, 1));
+          ep[5][2] = expand4P(extractBits(block, 73, 4), extractBits(block, 82, 1));
+
+          // 45 index bits starting at bit 83
+          uint64_t indexBits = 0;
+          for (int i = 10; i < 16; i++)
+            indexBits |= static_cast<uint64_t>(block[i]) << (8 * (i - 10));
+          indexBits >>= 3; // shift to align: bits [83:127] = 45 bits
+
+          for (int i = 0; i < 16; i++) {
+            uint32_t subset = g_bc7_partition3[partition * 16 + i];
+            uint32_t epIdx  = subset * 2;
+
+            // Determine if anchor (pixel 0 for subset 0, table lookup for others)
+            bool isAnchor = false;
+            if (i == 0) isAnchor = true;
+            else if (subset == 1 && i == g_bc7_anchor3_1[partition]) isAnchor = true;
+            else if (subset == 2 && i == g_bc7_anchor3_2[partition]) isAnchor = true;
+
+            uint32_t idx;
+            if (isAnchor) {
+              idx = 0;
+            } else {
+              int bitOffset = i * 3;
+              if (i > 0 && g_bc7_partition3[partition * 16 + 0] == g_bc7_partition3[partition * 16 + i])
+                bitOffset--;
+              if (i > 0 && i == g_bc7_anchor3_1[partition])
+                bitOffset--;
+              if (i > 0 && i == g_bc7_anchor3_2[partition])
+                bitOffset--;
+
+              idx = (indexBits >> bitOffset) & 7;
+            }
+
+            uint32_t w = g_bc7_weights3[idx];
+
+            pixels[i * 4 + 0] = bc7Interp(ep[epIdx][0], ep[epIdx + 1][0], w);
+            pixels[i * 4 + 1] = bc7Interp(ep[epIdx][1], ep[epIdx + 1][1], w);
+            pixels[i * 4 + 2] = bc7Interp(ep[epIdx][2], ep[epIdx + 1][2], w);
+            pixels[i * 4 + 3] = 255; // Mode 0 has no alpha
+          }
+
+        } else if (mode == 1) {
+          // Mode 1: 2 subsets, RGBP 6.6.6.1 endpoints, 3-bit indices, 64 partitions
+          // Layout: [0:1]=mode(01), [2:7]=partition(6),
+          //         [8:13]=R0, [14:19]=R1, [20:25]=R2, [26:31]=R3,
+          //         [32:37]=G0, [38:43]=G1, [44:49]=G2, [50:55]=G3,
+          //         [56:61]=B0, [62:67]=B1, [68:73]=B2, [74:79]=B3,
+          //         [80]=SPB0, [81]=SPB1, [82:127]=indices(46 bits)
+          //
+          // Shared P-bit: both endpoints in a subset share the same P-bit
+          // 8-bit_channel = (6-bit << 1) | shared_P-bit
+
+          uint32_t partition = extractBits(block, 2, 6);
+
+          // Extract shared P-bits
+          uint32_t spb0 = extractBits(block, 80, 1);
+          uint32_t spb1 = extractBits(block, 81, 1);
+
+          // 4 endpoints × 3 channels × 6 bits = 72 endpoint bits
+          auto expand6P = [](uint32_t v6, uint32_t pbit) -> uint8_t {
+            uint8_t v = static_cast<uint8_t>((v6 << 2) | (v6 >> 4));
+            return (v << 1) | static_cast<uint8_t>(pbit);
+          };
+
+          uint8_t ep[4][3]; // [endpoint][R=0,G=1,B=2]
+          // Subset 0 endpoints (share spb0)
+          ep[0][0] = expand6P(extractBits(block,  8, 6), spb0);
+          ep[1][0] = expand6P(extractBits(block, 14, 6), spb0);
+          ep[0][1] = expand6P(extractBits(block, 32, 6), spb0);
+          ep[1][1] = expand6P(extractBits(block, 38, 6), spb0);
+          ep[0][2] = expand6P(extractBits(block, 56, 6), spb0);
+          ep[1][2] = expand6P(extractBits(block, 62, 6), spb0);
+          // Subset 1 endpoints (share spb1)
+          ep[2][0] = expand6P(extractBits(block, 20, 6), spb1);
+          ep[3][0] = expand6P(extractBits(block, 26, 6), spb1);
+          ep[2][1] = expand6P(extractBits(block, 44, 6), spb1);
+          ep[3][1] = expand6P(extractBits(block, 50, 6), spb1);
+          ep[2][2] = expand6P(extractBits(block, 68, 6), spb1);
+          ep[3][2] = expand6P(extractBits(block, 74, 6), spb1);
+
+          // 46 index bits starting at bit 82
+          uint64_t indexBits = 0;
+          for (int i = 10; i < 16; i++)
+            indexBits |= static_cast<uint64_t>(block[i]) << (8 * (i - 10));
+          indexBits >>= 2; // shift to align: bits [82:127] = 46 bits
+
+          for (int i = 0; i < 16; i++) {
+            uint32_t subset = g_bc7_partition2[partition * 16 + i];
+            uint32_t epIdx  = subset * 2;
+
+            bool isAnchor = false;
+            if (i == 0) isAnchor = true;
+            else if (subset == 1 && i == g_bc7_anchor2[partition]) isAnchor = true;
+
+            uint32_t idx;
+            if (isAnchor) {
+              idx = 0;
+            } else {
+              int bitOffset = i * 3;
+              if (i > 0 && g_bc7_partition2[partition * 16 + 0] == g_bc7_partition2[partition * 16 + i])
+                bitOffset--;
+              if (i > 0 && i == g_bc7_anchor2[partition])
+                bitOffset--;
+
+              idx = (indexBits >> bitOffset) & 7;
+            }
+
+            uint32_t w = g_bc7_weights3[idx];
+
+            pixels[i * 4 + 0] = bc7Interp(ep[epIdx][0], ep[epIdx + 1][0], w);
+            pixels[i * 4 + 1] = bc7Interp(ep[epIdx][1], ep[epIdx + 1][1], w);
+            pixels[i * 4 + 2] = bc7Interp(ep[epIdx][2], ep[epIdx + 1][2], w);
+            pixels[i * 4 + 3] = 255; // Mode 1 has no alpha
+          }
+
+        } else if (mode == 4) {
+          // Mode 4: 1 subset, RGB 5.5.5 + A 6-bit endpoints, mixed 2/3-bit indices
+          // Layout: [0:4]=mode(00001), [5:6]=rotation, [7]=ISB,
+          //         [8:12]=R0(5), [13:17]=R1(5), [18:22]=G0(5), [23:27]=G1(5),
+          //         [28:32]=B0(5), [33:37]=B1(5), [38:43]=A0(6), [44:49]=A1(6),
+          //         [50:80]=primary_idx(31), [81:127]=secondary_idx(47)
+          //
+          // ISB=0: color=2-bit(primary), alpha=3-bit(secondary)
+          // ISB=1: color=3-bit(secondary), alpha=2-bit(primary)
+
+          uint32_t rotation = extractBits(block, 5, 2);
+          uint32_t isb = extractBits(block, 7, 1);
+
+          // 5-bit RGB endpoints → 8-bit via bit replication
+          auto expand5 = [](uint32_t v5) -> uint8_t {
+            return static_cast<uint8_t>((v5 << 3) | (v5 >> 2));
+          };
+          // 6-bit alpha → 8-bit via bit replication
+          auto expand6 = [](uint32_t v6) -> uint8_t {
+            return static_cast<uint8_t>((v6 << 2) | (v6 >> 4));
+          };
+
+          uint8_t r0 = expand5(extractBits(block, 8,  5));
+          uint8_t r1 = expand5(extractBits(block, 13, 5));
+          uint8_t g0 = expand5(extractBits(block, 18, 5));
+          uint8_t g1 = expand5(extractBits(block, 23, 5));
+          uint8_t b0 = expand5(extractBits(block, 28, 5));
+          uint8_t b1 = expand5(extractBits(block, 33, 5));
+          uint8_t a0 = expand6(extractBits(block, 38, 6));
+          uint8_t a1 = expand6(extractBits(block, 44, 6));
+
+          // Primary indices (2-bit) from bits [50:80], 31 bits
+          // Anchor pixel 0: 1 bit (MSB implicitly 0), pixels 1-15: 2 bits each
+          uint32_t primIdx[16];
+          primIdx[0] = extractBits(block, 50, 1);
+          for (int pi = 1; pi < 16; pi++)
+            primIdx[pi] = extractBits(block, 51 + (pi - 1) * 2, 2);
+
+          // Secondary indices (3-bit) from bits [81:127], 47 bits
+          // Anchor pixel 0: 2 bits (MSB implicitly 0), pixels 1-15: 3 bits each
+          uint32_t secIdx[16];
+          secIdx[0] = extractBits(block, 81, 2);
+          for (int pi = 1; pi < 16; pi++)
+            secIdx[pi] = extractBits(block, 83 + (pi - 1) * 3, 3);
+
+          for (int pi = 0; pi < 16; pi++) {
+            uint32_t colorWeight, alphaWeight;
+            if (isb == 0) {
+              colorWeight = g_bc7_weights2[primIdx[pi]];
+              alphaWeight = g_bc7_weights3[secIdx[pi]];
+            } else {
+              colorWeight = g_bc7_weights3[secIdx[pi]];
+              alphaWeight = g_bc7_weights2[primIdx[pi]];
+            }
+
+            uint8_t r = bc7Interp(r0, r1, colorWeight);
+            uint8_t g = bc7Interp(g0, g1, colorWeight);
+            uint8_t b = bc7Interp(b0, b1, colorWeight);
+            uint8_t a = bc7Interp(a0, a1, alphaWeight);
+
+            // Apply component rotation
+            switch (rotation) {
+              case 0: break;                          // RGB|A
+              case 1: std::swap(r, a); break;         // A|RGB (swap R↔A)
+              case 2: std::swap(g, a); break;         // RAGB (swap G↔A)
+              case 3: std::swap(b, a); break;         // RGBA→swap B↔A
+            }
+
+            pixels[pi * 4 + 0] = r;
+            pixels[pi * 4 + 1] = g;
+            pixels[pi * 4 + 2] = b;
+            pixels[pi * 4 + 3] = a;
+          }
+
+        } else if (mode == 5) {
+          // Mode 5: 1 subset, RGB 7.7.7 + A 8-bit endpoints, 2/2-bit indices
+          // Layout: [0:5]=mode(000001), [6:7]=rotation,
+          //         [8:14]=R0(7), [15:21]=R1(7), [22:28]=G0(7), [29:35]=G1(7),
+          //         [36:42]=B0(7), [43:49]=B1(7), [50:57]=A0(8), [58:65]=A1(8),
+          //         [66:96]=primary_idx(31), [97:127]=secondary_idx(31)
+
+          uint32_t rotation = extractBits(block, 6, 2);
+
+          // 7-bit → 8-bit via bit replication
+          auto expand7 = [](uint32_t v7) -> uint8_t {
+            return static_cast<uint8_t>((v7 << 1) | (v7 >> 6));
+          };
+
+          uint8_t r0 = expand7(extractBits(block, 8,  7));
+          uint8_t r1 = expand7(extractBits(block, 15, 7));
+          uint8_t g0 = expand7(extractBits(block, 22, 7));
+          uint8_t g1 = expand7(extractBits(block, 29, 7));
+          uint8_t b0 = expand7(extractBits(block, 36, 7));
+          uint8_t b1 = expand7(extractBits(block, 43, 7));
+          uint8_t a0 = static_cast<uint8_t>(extractBits(block, 50, 8));
+          uint8_t a1 = static_cast<uint8_t>(extractBits(block, 58, 8));
+
+          // Primary indices (2-bit) from bits [66:96], 31 bits
+          uint32_t primIdx[16];
+          primIdx[0] = extractBits(block, 66, 1);
+          for (int pi = 1; pi < 16; pi++)
+            primIdx[pi] = extractBits(block, 67 + (pi - 1) * 2, 2);
+
+          // Secondary indices (2-bit) from bits [97:127], 31 bits
+          uint32_t secIdx[16];
+          secIdx[0] = extractBits(block, 97, 1);
+          for (int pi = 1; pi < 16; pi++)
+            secIdx[pi] = extractBits(block, 98 + (pi - 1) * 2, 2);
+
+          for (int pi = 0; pi < 16; pi++) {
+            uint32_t colorWeight = g_bc7_weights2[primIdx[pi]];
+            uint32_t alphaWeight = g_bc7_weights2[secIdx[pi]];
+
+            uint8_t r = bc7Interp(r0, r1, colorWeight);
+            uint8_t g = bc7Interp(g0, g1, colorWeight);
+            uint8_t b = bc7Interp(b0, b1, colorWeight);
+            uint8_t a = bc7Interp(a0, a1, alphaWeight);
+
+            switch (rotation) {
+              case 0: break;
+              case 1: std::swap(r, a); break;
+              case 2: std::swap(g, a); break;
+              case 3: std::swap(b, a); break;
+            }
+
+            pixels[pi * 4 + 0] = r;
+            pixels[pi * 4 + 1] = g;
+            pixels[pi * 4 + 2] = b;
+            pixels[pi * 4 + 3] = a;
+          }
+
+        } else if (mode == 7) {
+          // Mode 7: 2 subsets, RGBAP 5.5.5.5.1 endpoints, 2-bit indices, 64 partitions
+          // Layout: [0:7]=mode(00000001), [8:13]=partition(6),
+          //         [14:18]=R0(5), [19:23]=R1(5), [24:28]=R2(5), [29:33]=R3(5),
+          //         [34:38]=G0(5), [39:43]=G1(5), [44:48]=G2(5), [49:53]=G3(5),
+          //         [54:58]=B0(5), [59:63]=B1(5), [64:68]=B2(5), [69:73]=B3(5),
+          //         [74:78]=A0(5), [79:83]=A1(5), [84:88]=A2(5), [89:93]=A3(5),
+          //         [94]=EPB0, [95]=EPB1, [96]=EPB2, [97]=EPB3,
+          //         [98:127]=indices(30 bits)
+
+          uint32_t partition = extractBits(block, 8, 6);
+
+          // Extract P-bits (unique per endpoint)
+          uint32_t epb0 = extractBits(block, 94, 1);
+          uint32_t epb1 = extractBits(block, 95, 1);
+          uint32_t epb2 = extractBits(block, 96, 1);
+          uint32_t epb3 = extractBits(block, 97, 1);
+
+          // Expand 5-bit + P-bit to 8-bit: (5bit << 3 | replicate) then (<<1 | P)
+          auto expand5P = [](uint32_t v5, uint32_t pbit) -> uint8_t {
+            uint8_t v = static_cast<uint8_t>((v5 << 3) | (v5 >> 2));
+            return (v << 1) | static_cast<uint8_t>(pbit);
+          };
+
+          // 4 endpoints × RGBA channels
+          uint8_t ep[4][4]; // [endpoint][R=0,G=1,B=2,A=3]
+          ep[0][0] = expand5P(extractBits(block, 14, 5), epb0);
+          ep[1][0] = expand5P(extractBits(block, 19, 5), epb1);
+          ep[2][0] = expand5P(extractBits(block, 24, 5), epb2);
+          ep[3][0] = expand5P(extractBits(block, 29, 5), epb3);
+          ep[0][1] = expand5P(extractBits(block, 34, 5), epb0);
+          ep[1][1] = expand5P(extractBits(block, 39, 5), epb1);
+          ep[2][1] = expand5P(extractBits(block, 44, 5), epb2);
+          ep[3][1] = expand5P(extractBits(block, 49, 5), epb3);
+          ep[0][2] = expand5P(extractBits(block, 54, 5), epb0);
+          ep[1][2] = expand5P(extractBits(block, 59, 5), epb1);
+          ep[2][2] = expand5P(extractBits(block, 64, 5), epb2);
+          ep[3][2] = expand5P(extractBits(block, 69, 5), epb3);
+          ep[0][3] = expand5P(extractBits(block, 74, 5), epb0);
+          ep[1][3] = expand5P(extractBits(block, 79, 5), epb1);
+          ep[2][3] = expand5P(extractBits(block, 84, 5), epb2);
+          ep[3][3] = expand5P(extractBits(block, 89, 5), epb3);
+
+          // 30 index bits starting at bit 98
+          uint64_t indexBits = 0;
+          for (int bi = 12; bi < 16; bi++)
+            indexBits |= static_cast<uint64_t>(block[bi]) << (8 * (bi - 12));
+          indexBits >>= 2; // align: bits [98:127] = 30 bits
+
+          for (int pi = 0; pi < 16; pi++) {
+            uint32_t subset = g_bc7_partition2[partition * 16 + pi];
+            uint32_t epIdx  = subset * 2;
+
+            bool isAnchor = false;
+            if (pi == 0) isAnchor = true;
+            else if (subset == 1 && pi == g_bc7_anchor2[partition]) isAnchor = true;
+
+            uint32_t idx;
+            if (isAnchor) {
+              idx = 0;
+            } else {
+              int bitOffset = pi * 2;
+              if (pi > 0 && g_bc7_partition2[partition * 16 + 0] == g_bc7_partition2[partition * 16 + pi])
+                bitOffset--;
+              if (pi > 0 && pi == g_bc7_anchor2[partition])
+                bitOffset--;
+              idx = (indexBits >> bitOffset) & 3;
+            }
+
+            uint32_t w = g_bc7_weights2[idx];
+
+            pixels[pi * 4 + 0] = bc7Interp(ep[epIdx][0], ep[epIdx + 1][0], w);
+            pixels[pi * 4 + 1] = bc7Interp(ep[epIdx][1], ep[epIdx + 1][1], w);
+            pixels[pi * 4 + 2] = bc7Interp(ep[epIdx][2], ep[epIdx + 1][2], w);
+            pixels[pi * 4 + 3] = bc7Interp(ep[epIdx][3], ep[epIdx + 1][3], w);
+          }
+
+        } else {
+          // Unknown mode (should not happen with valid BC7 data)
+#ifndef NDEBUG
+          bc7Stats().unhandledBlocks++;
+#endif
+          for (int i = 0; i < 16; i++) {
+            pixels[i * 4 + 0] = 255;
+            pixels[i * 4 + 1] = 0;
+            pixels[i * 4 + 2] = 255;
+            pixels[i * 4 + 3] = 255;
           }
         }
         break;

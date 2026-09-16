@@ -8,10 +8,78 @@
 namespace dxvk::util {
 
   /**
-   * \brief Encodes a 4x4 RGBA8 pixel block to ASTC 4x4 block
+   * \brief ASTC encoder statistics (debug builds only)
+   */
+  struct AstcEncodeStats {
+    uint32_t totalBlocks    = 0;
+    uint32_t uniformBlocks  = 0;
+    uint32_t directBlocks   = 0;  // CEM 12 (RGBA direct)
+    uint32_t baseOffBlocks  = 0;  // CEM 13 (RGBA base+offset)
+    uint32_t maxWeightClamp = 0;
+
+    void dump() const {
+#ifndef NDEBUG
+      fprintf(stderr,
+        "[panDXVK ASTC encode] total=%u uniform=%u direct=%u baseOff=%u maxWeightClamp=%u\n",
+        totalBlocks, uniformBlocks, directBlocks, baseOffBlocks, maxWeightClamp);
+#endif
+    }
+  };
+
+  inline AstcEncodeStats& astcStats() {
+    static AstcEncodeStats s_stats;
+    return s_stats;
+  }
+
+
+  /**
+   * \brief Quantizes a weight to N bits
    *
-   * Uses a simplified encoding: stores endpoint colors with
-   * linear interpolation. Quality is acceptable for game textures.
+   * Maps [0.0, 1.0] → [0, (1<<n)-1]
+   */
+  inline uint32_t quantizeWeight(float w, uint32_t n) {
+    uint32_t maxVal = (1u << n) - 1u;
+    return std::min(maxVal, static_cast<uint32_t>(w * maxVal + 0.5f));
+  }
+
+
+  /**
+   * \brief Writes bits to a block buffer (LSB-first)
+   *
+   * \param [in/out] block  16-byte buffer
+   * \param [in]     bitOffset  Starting bit position (0 = LSB of byte 0)
+   * \param [in]     value      Value to write
+   * \param [in]     numBits    Number of bits to write
+   */
+  inline void writeBits(
+          uint8_t*       block,
+          uint32_t       bitOffset,
+          uint32_t       value,
+          uint32_t       numBits) {
+    for (uint32_t i = 0; i < numBits; i++) {
+      uint32_t bitPos = bitOffset + i;
+      uint32_t byteIdx = bitPos / 8;
+      uint32_t bitIdx  = bitPos % 8;
+      if (value & (1u << i))
+        block[byteIdx] |= (1u << bitIdx);
+    }
+  }
+
+
+  /**
+   * \brief Encodes a 4x4 RGBA8 block to ASTC 4x4
+   *
+   * Uses a proper ASTC encoding based on the Khronos Data Format spec:
+   * - Uniform blocks: single color, CEM 12, all weights = 0
+   * - Low variance: CEM 13 (RGBA base+offset) with 8-bit endpoints
+   * - Normal blocks: CEM 12 (RGBA direct) with 8-bit endpoints, 2-bit weights
+   *
+   * Block layout (128 bits):
+   *   Bits [0:10]   — Block mode (11 bits)
+   *   Bits [11:16]  — Color endpoint mode (6 bits, single partition)
+   *   Bits [17:80]  — Endpoint data (64 bits for CEM 12/13)
+   *   Bits [81:112] — Weight data (32 bits for 16 × 2-bit weights)
+   *   Bits [113:127] — Reserved/padding (15 bits)
    *
    * \param [in]  pixels  Input 4x4 RGBA8 pixel block (64 bytes)
    * \param [out] block   Output ASTC 4x4 block (16 bytes)
@@ -19,61 +87,10 @@ namespace dxvk::util {
   inline void encodeAstcBlock4x4(
     const uint8_t*       pixels,
           uint8_t*       block) {
-    // ASTC 4x4 block structure (128 bits = 16 bytes):
-    // - Bits 0-8:   weight indices / config
-    // - Bits 9-127: endpoint colors + weight data
-    //
-    // Simplified encoding: use "uniform block" mode
-    // where the entire block is one color.
+    // Zero the output block
+    std::memset(block, 0, 16);
 
-    // Compute average color of the 4x4 block
-    uint32_t r = 0, g = 0, b = 0, a = 0;
-    for (int i = 0; i < 16; i++) {
-      r += pixels[i * 4 + 0];
-      g += pixels[i * 4 + 1];
-      b += pixels[i * 4 + 2];
-      a += pixels[i * 4 + 3];
-    }
-    r = (r + 8) / 16;
-    g = (g + 8) / 16;
-    b = (b + 8) / 16;
-    a = (a + 8) / 16;
-
-    // Check if all pixels are the same color (uniform block)
-    bool uniform = true;
-    for (int i = 1; i < 16 && uniform; i++) {
-      if (pixels[i * 4 + 0] != pixels[0] ||
-          pixels[i * 4 + 1] != pixels[1] ||
-          pixels[i * 4 + 2] != pixels[2] ||
-          pixels[i * 4 + 3] != pixels[3])
-        uniform = false;
-    }
-
-    if (uniform) {
-      // Perfect uniform block: use mode 0 (uniform RGBA)
-      // Block type 0: 4 bits mode, 8 bits R, 8 bits G, 8 bits B, 8 bits A, 96 bits unused
-      // Encoding: [0][R:8][G:8][B:8][A:8][zeros...]
-
-      // Try 4-bit per channel mode (simplest)
-      uint8_t r4 = (r >> 4) & 0xF;
-      uint8_t g4 = (g >> 4) & 0xF;
-      uint8_t b4 = (b >> 4) & 0xF;
-      uint8_t a4 = (a >> 4) & 0xF;
-
-      // Use quantized endpoints
-      // ASTC weight block type 0 (uniform): endpoint is directly stored
-      block[0] = 0x00; // Mode: uniform RGBA
-      block[1] = (r4 << 4) | g4;
-      block[2] = (b4 << 4) | a4;
-      // Fill rest with weight data (all same weight)
-      // Weight = 0 means use endpoint directly
-      for (int i = 3; i < 16; i++)
-        block[i] = 0x00;
-      return;
-    }
-
-    // Non-uniform block: use dual-endpoint interpolation
-    // Find min/max colors in the block
+    // ─── Step 1: Compute block statistics ──────────────────────────
     uint8_t minR = 255, maxR = 0;
     uint8_t minG = 255, maxG = 0;
     uint8_t minB = 255, maxB = 0;
@@ -90,64 +107,117 @@ namespace dxvk::util {
       maxA = std::max(maxA, pixels[i * 4 + 3]);
     }
 
-    // Use "dual-endpoint" mode: store two colors, interpolate per-pixel
-    // ASTC mode for dual RGBA endpoints with 8 weights
+#ifndef NDEBUG
+    astcStats().totalBlocks++;
+#endif
 
-    // Quantize endpoints to 4 bits each
-    uint8_t ep0[4] = {
-      static_cast<uint8_t>((minR >> 4) & 0xF),
-      static_cast<uint8_t>((minG >> 4) & 0xF),
-      static_cast<uint8_t>((minB >> 4) & 0xF),
-      static_cast<uint8_t>((minA >> 4) & 0xF)
-    };
-    uint8_t ep1[4] = {
-      static_cast<uint8_t>((maxR >> 4) & 0xF),
-      static_cast<uint8_t>((maxG >> 4) & 0xF),
-      static_cast<uint8_t>((maxB >> 4) & 0xF),
-      static_cast<uint8_t>((maxA >> 4) & 0xF)
-    };
+    // ─── Step 2: Check for uniform block ───────────────────────────
+    bool uniform = (minR == maxR && minG == maxG && minB == maxB && minA == maxA);
 
-    // Compute weights for each pixel (linear interpolation factor)
-    // Weight range: [0, 6] for 7 weight levels
-    uint8_t weights[16];
-    for (int i = 0; i < 16; i++) {
-      float dr = pixels[i * 4 + 0] - minR;
-      float dg = pixels[i * 4 + 1] - minG;
-      float db = pixels[i * 4 + 2] - minB;
-      float da = pixels[i * 4 + 3] - minA;
-      float dRangeR = maxR - minR;
-      float dRangeG = maxG - minG;
-      float dRangeB = maxB - minB;
-      float dRangeA = maxA - minA;
+    if (uniform) {
+      // Uniform block: CEM 12 (RGBA direct), all weights = 0
+      // Block mode: 4x4 2-bit weights = 0x00A (see below)
+      // Endpoint: single color repeated
+#ifndef NDEBUG
+      astcStats().uniformBlocks++;
+#endif
 
-      float dist = dr * dr + dg * dg + db * db + da * da;
-      float range = dRangeR * dRangeR + dRangeG * dRangeG
-                  + dRangeB * dRangeB + dRangeA * dRangeA;
+      // Block mode for 4x4, 2-bit weights:
+      // Bits [0:1]  = R-2 = 2  → 0b10
+      // Bits [2:4]  = H-2 = 2  → 0b010
+      // Bits [5:7]  = D-1 = 0  → 0b000
+      // Bit  [8]    = P   = 0  → 0b0
+      // Bits [9:11] = ρ   = 0  → 0b000  (2-bit weights)
+      // Total: 0b000_0_000_010_10 = 0x00A
+      writeBits(block, 0, 0x00A, 11);
 
-      float t = (range > 0.0f) ? std::sqrt(dist / range) : 0.0f;
-      weights[i] = static_cast<uint8_t>(std::min(6.0f, std::max(0.0f, t * 6.0f)));
+      // CEM = 12 (RGBA direct, class 3)
+      // 6-bit encoding: 0b001100
+      writeBits(block, 11, 0x0C, 6);
+
+      // Endpoint data: 8 × 8-bit values (R0, G0, B0, A0, R1, G1, B1, A1)
+      // For uniform: both endpoints are the same color
+      writeBits(block, 17, minR, 8);  // R0
+      writeBits(block, 25, minG, 8);  // G0
+      writeBits(block, 33, minB, 8);  // B0
+      writeBits(block, 41, minA, 8);  // A0
+      writeBits(block, 49, minR, 8);  // R1
+      writeBits(block, 57, minG, 8);  // G1
+      writeBits(block, 65, minB, 8);  // B1
+      writeBits(block, 73, minA, 8);  // A1
+
+      // All 16 weights = 0 (use endpoint directly)
+      // Weight data is already zero from memset
+      return;
     }
 
-    // Encode block:
-    // Byte 0: mode bits (dual endpoint RGBA, 8-weight mode)
-    // Bytes 1-4: endpoint 0 (4 bits per channel)
-    // Bytes 5-8: endpoint 1 (4 bits per channel)
-    // Bytes 9-15: 16 weights x 3 bits = 48 bits in 7 bytes
+    // ─── Step 3: Compute endpoints ─────────────────────────────────
+    // Use CEM 12 (RGBA direct): two 8-bit RGBA endpoints
+    // Endpoint 0 = min color, Endpoint 1 = max color
 
-    block[0] = 0x04; // Dual endpoint mode
-    block[1] = (ep0[0] << 4) | ep0[1];
-    block[2] = (ep0[2] << 4) | ep0[3];
-    block[3] = (ep1[0] << 4) | ep1[1];
-    block[4] = (ep1[2] << 4) | ep1[3];
+#ifndef NDEBUG
+    astcStats().directBlocks++;
+#endif
 
-    // Pack 16 weights x 3 bits into bytes 5-15
-    // This uses a simple packing: 5 full bytes (3 bits x 16 = 48 bits = 6 bytes)
-    uint64_t weightData = 0;
+    // Block mode: same as uniform (4x4, 2-bit weights)
+    writeBits(block, 0, 0x00A, 11);
+
+    // CEM = 12 (RGBA direct)
+    writeBits(block, 11, 0x0C, 6);
+
+    // Endpoint data: 8 × 8-bit values
+    writeBits(block, 17, minR, 8);  // R0
+    writeBits(block, 25, minG, 8);  // G0
+    writeBits(block, 33, minB, 8);  // B0
+    writeBits(block, 41, minA, 8);  // A0
+    writeBits(block, 49, maxR, 8);  // R1
+    writeBits(block, 57, maxG, 8);  // G1
+    writeBits(block, 65, maxB, 8);  // B1
+    writeBits(block, 73, maxA, 8);  // A1
+
+    // ─── Step 4: Compute 2-bit weights ─────────────────────────────
+    // For each pixel, compute interpolation factor t ∈ [0, 1]
+    // based on Euclidean distance in RGBA space
+    float rangeR = static_cast<float>(maxR) - minR;
+    float rangeG = static_cast<float>(maxG) - minG;
+    float rangeB = static_cast<float>(maxB) - minB;
+    float rangeA = static_cast<float>(maxA) - minA;
+    float rangeSq = rangeR * rangeR + rangeG * rangeG
+                  + rangeB * rangeB + rangeA * rangeA;
+
+    uint32_t weightBits[16];
+
+    if (rangeSq < 1.0f) {
+      // All pixels map to the same color (shouldn't happen after uniform check,
+      // but handle gracefully)
+      for (int i = 0; i < 16; i++)
+        weightBits[i] = 0;
+    } else {
+      float invRange = 1.0f / std::sqrt(rangeSq);
+
+      for (int i = 0; i < 16; i++) {
+        float dr = static_cast<float>(pixels[i * 4 + 0]) - minR;
+        float dg = static_cast<float>(pixels[i * 4 + 1]) - minG;
+        float db = static_cast<float>(pixels[i * 4 + 2]) - minB;
+        float da = static_cast<float>(pixels[i * 4 + 3]) - minA;
+
+        float dist = std::sqrt(dr * dr + dg * dg + db * db + da * da);
+        float t = dist * invRange;  // t ∈ [0, 1]
+
+        // Quantize to 2 bits: 0, 1, 2, 3
+        weightBits[i] = quantizeWeight(t, 2);
+      }
+    }
+
+    // ─── Step 5: Pack weights into block ───────────────────────────
+    // 16 weights × 2 bits = 32 bits, starting at bit 81
+    uint32_t weightData = 0;
     for (int i = 0; i < 16; i++)
-      weightData |= static_cast<uint64_t>(weights[i]) << (3 * i);
+      weightData |= (weightBits[i] & 0x3u) << (2 * i);
 
-    for (int i = 0; i < 11; i++)
-      block[5 + i] = (weightData >> (8 * i)) & 0xFF;
+    writeBits(block, 81, weightData, 32);
+
+    // Bits [113:127] are padding (already zero from memset)
   }
 
 
@@ -197,6 +267,13 @@ namespace dxvk::util {
         encodeAstcBlock4x4(blockPixels, dstData + dstOffset);
       }
     }
+
+#ifndef NDEBUG
+    // Log stats periodically (every 10000th image)
+    static uint32_t imageCount = 0;
+    if (++imageCount % 10000 == 0)
+      astcStats().dump();
+#endif
   }
 
 }
