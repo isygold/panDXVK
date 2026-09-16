@@ -117,21 +117,23 @@ jobs:
 
       - name: Wrap WCP in zip
         run: |
-          cd ..
           python3 -c "
           import zipfile, glob
-          wcp_files = glob.glob('workdir/*.wcp')
+          wcp_files = glob.glob('*.wcp')
+          if not wcp_files:
+              raise SystemExit('ERROR: No .wcp files found in $GITHUB_WORKSPACE')
+          print(f'Packing {len(wcp_files)} file(s): {wcp_files}')
           with zipfile.ZipFile('wcp.zip', 'w', zipfile.ZIP_STORED) as zf:
               for f in wcp_files:
                   zf.write(f)
           "
-          mv wcp.zip workdir/wcp.zip
+          ls -lh wcp.zip
 
       - name: Upload WCP
         uses: actions/upload-artifact@v4
         with:
-          name: wcp-pandxvk-${{ steps.version.outputs.version_name }}
-          path: ./workdir/wcp.zip
+          name: wcp-pandxvk-${{ steps.version.outputs.version_name }}-${{ steps.get-sha.outputs.sha }}
+          path: ./wcp.zip
 
       - name: Upload panDXVK config
         uses: actions/upload-artifact@v4
