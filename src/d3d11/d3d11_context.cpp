@@ -3697,48 +3697,6 @@ namespace dxvk {
 
     VkFormat packedFormat = pDstTexture->GetPackedFormat();
 
-    // panDXVK: Transcode BC→ASTC if destination is ASTC (PanVK detected)
-    // Use heap allocation — ASTC output can be ~8MB for 4K textures,
-    // and DXVK thread stacks may be as small as 1MB.
-    std::unique_ptr<uint8_t[]> astcData;
-
-    if (util::isBcFormat(packedFormat)
-        && m_device->adapter()->isPanVk()
-        && !m_device->features().core.features.textureCompressionBC) {
-      auto srcExtent = pDstTexture->MipLevelExtent(
-        pDstTexture->GetSubresourceFromIndex(
-          imageFormatInfo(packedFormat)->aspectMask, DstSubresource).mipLevel);
-
-      auto t0 = std::chrono::high_resolution_clock::now();
-
-      astcData = util::transcodeBcToAstcAlloc(
-        packedFormat, static_cast<const uint8_t*>(pSrcData),
-        srcExtent.width, srcExtent.height,
-        SrcRowPitch);
-
-      auto t1 = std::chrono::high_resolution_clock::now();
-      double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-
-      if (!astcData) {
-        Logger::err(str::format(
-          "panDXVK: BC\u2192ASTC transcode FAILED ",
-          srcExtent.width, "x", srcExtent.height, " ",
-          "DXGI_FORMAT=", packedFormat, " sub=", DstSubresource));
-        return;
-      }
-
-      Logger::info(str::format(
-        "panDXVK: BC\u2192ASTC transcode ",
-        srcExtent.width, "x", srcExtent.height, " ",
-        "DXGI_FORMAT=", packedFormat, " sub=", DstSubresource,
-        " ", ms, "ms"));
-
-      // Override src data + format for the staging buffer path below.
-      pSrcData = astcData.get();
-      SrcRowPitch = srcExtent.width * 4;
-      packedFormat = util::bcToAstcFormat(packedFormat);
-    }
-
     auto formatInfo = imageFormatInfo(packedFormat);
     auto subresource = pDstTexture->GetSubresourceFromIndex(
         formatInfo->aspectMask, DstSubresource);
@@ -3761,6 +3719,46 @@ namespace dxvk {
       extent.width  = pDstBox->right - pDstBox->left;
       extent.height = pDstBox->bottom - pDstBox->top;
       extent.depth  = pDstBox->back - pDstBox->front;
+    }
+
+    // panDXVK: Transcode BC→ASTC if destination is ASTC (PanVK detected)
+    // Use heap allocation — ASTC output can be ~8MB for 4K textures,
+    // and DXVK thread stacks may be as small as 1MB.
+    std::unique_ptr<uint8_t[]> astcData;
+
+    if (util::isBcFormat(packedFormat)
+        && m_device->adapter()->isPanVk()
+        && !m_device->features().core.features.textureCompressionBC) {
+      // Use the actual update extent (pDstBox subregion or full mip level)
+      auto t0 = std::chrono::high_resolution_clock::now();
+
+      astcData = util::transcodeBcToAstcAlloc(
+        packedFormat, static_cast<const uint8_t*>(pSrcData),
+        extent.width, extent.height,
+        SrcRowPitch);
+
+      auto t1 = std::chrono::high_resolution_clock::now();
+      double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+      if (!astcData) {
+        Logger::err(str::format(
+          "panDXVK: BC\u2192ASTC transcode FAILED ",
+          extent.width, "x", extent.height, " ",
+          "DXGI_FORMAT=", packedFormat, " sub=", DstSubresource));
+        return;
+      }
+
+      Logger::info(str::format(
+        "panDXVK: BC\u2192ASTC transcode ",
+        extent.width, "x", extent.height, " ",
+        "DXGI_FORMAT=", packedFormat, " sub=", DstSubresource,
+        " ", ms, "ms"));
+
+      // Override src data + format for the staging buffer path below.
+      pSrcData = astcData.get();
+      SrcRowPitch = extent.width * 4;
+      packedFormat = util::bcToAstcFormat(packedFormat);
+      formatInfo = imageFormatInfo(packedFormat);
     }
 
     if (!util::isBlockAligned(offset, extent, formatInfo->blockSize, mipExtent)) {
