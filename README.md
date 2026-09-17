@@ -50,6 +50,23 @@ panDXVK uses the same configuration mechanism as upstream DXVK. Set `DXVK_CONFIG
 - **AppendSlice path not yet patched.** The `AppendSlice` D3D11 path may also encounter BC textures. This is a known gap. If you see BC format errors in `AppendSlice`, file an issue.
 - **CI builds are automated.** The GitHub Actions workflow builds both x64 and x32 on Fedora 44 with MinGW-w64. If the Fedora mirror is temporarily unreachable, the workflow retries automatically.
 
+## Why Some Users Need the BC Wrapper and Others Don't
+
+The wrapper does this:
+- It's a Vulkan layer that tells the GPU: "I support BC textures"
+- panDXVK sees this and says: "OK, I'll skip the transcode and upload BC textures directly"
+
+The problem:
+- On some devices, the blob driver actually handles BC textures fine → game works
+- On other devices, the driver genuinely can't handle BC → game breaks
+
+So:
+- Users where it works = their device's blob driver secretly supports BC even though PanVK doesn't
+- Users where it doesn't work = their device truly can't handle BC textures
+
+The fix:
+panDXVK should NOT rely on the wrapper. It should always do the software BC→ASTC transcode when on Mali, regardless of what the wrapper says.
+
 ## Upstream Reference
 - Upstream DXVK: [doitsujin/dxvk](https://github.com/doitsujin/dxvk)
 - DXVK Sarek: [pythonlover02/dxvk-sarek](https://github.com/pythonlover02/dxvk-sarek)
