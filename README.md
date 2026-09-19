@@ -9,7 +9,7 @@ Based on [DXVK v1.10.3](https://github.com/doitsujin/dxvk/tree/v1.10.3), forked 
 - **Automatic Detection**: Transcode activates only when `DxvkAdapter::isPanVk()` (vendor ID `0x13B5`) AND `textureCompressionBC = false`. Devices with blob driver BC support are left alone.
 - **Format Remap**: VkImage, SRV, and RTV formats are remapped from BC to ASTC transparently. No game-side changes required.
 - **Heap-Allocated Buffers**: RGBA8 intermediate and ASTC output are heap-allocated to avoid stack overflow on DXVK's small thread stacks.
-- **Transcode Timing**: INFO-level logging reports per-subresource transcode time for profiling.
+- **Transcode Timing**: Debug-gated logging reports per-subresource transcode time for profiling (debug builds only — zero cost in release).
 - **x64 + x32**: Both 64-bit and 32-bit DLLs built and verified.
 
 ## Installation (Winlator / Bannerlator)
@@ -36,12 +36,12 @@ panDXVK uses the same configuration mechanism as upstream DXVK. Set `DXVK_CONFIG
 | Variable | Values | Description |
 |----------|--------|-------------|
 | `DXVK_HUD` | `devinfo`, `fps`, `frametimes`, `full`, etc. | HUD overlay. See upstream docs. |
-| `DXVK_LOG_LEVEL` | `none`, `error`, `warn`, `info`, `debug` | Logging verbosity. `info` shows transcode timing. |
+| `DXVK_LOG_LEVEL` | `none`, `error`, `warn`, `info`, `debug` | Logging verbosity. Transcode diagnostics need a debug build + `debug` level. |
 | `DXVK_LOG_PATH` | path | Directory for log files. |
 | `DXVK_FRAME_RATE` | `0` (uncap), or FPS limit | Frame rate cap. |
 
 ## Notes
-- **I need your logs.** If you hit a crash, rendering glitch, or anything weird, grab the log file from your Wine prefix's drive_c (usually `wine_debug.log` or `d3d11.log` in the app directory) and paste it to [panDXVK Logs](https://github.com/isygold/panDXVK-logs/issues). Set `DXVK_LOG_LEVEL=info` before launching the game so the log captures BC→ASTC transcode activity. Without logs, I cannot help you.
+- **I need your logs.** If you hit a crash, rendering glitch, or anything weird, grab the log file from your Wine prefix's drive_c (usually `wine_debug.log` or `d3d11.log` in the app directory) and paste it to [panDXVK Logs](https://github.com/isygold/panDXVK-logs/issues). For BC→ASTC transcode diagnostics you need a debug build with `DXVK_LOG_LEVEL=debug`. Without logs, I cannot help you.
 - **ASTC 4x4 is lossy.** BC1–BC7 textures are decoded to RGBA8 and re-encoded to ASTC 4x4. This introduces compression artifacts not present in the original. For most games the visual difference is minimal, but texture-heavy UIs or screenshots may show subtle banding.
 - **BC6H maps to ASTC 6x6 LDR.** BC6H (HDR float RGB) is approximated as ASTC 6x6 UNORM. Full HDR fidelity is not preserved.
 - **PanVK must be the active Vulkan driver.** panDXVK detects Mali via vendor ID `0x13B5`. If you are running a blob driver that already reports `textureCompressionBC = true`, the transcode is skipped entirely — the game's BC textures are uploaded as-is.
@@ -77,7 +77,7 @@ Tested so far — all with wrapper active (`textureCompressionBC = 1`, transcode
 Still missing — the one test that proves the transcode path:
 1. Select the raw PanVK driver entry (not Wrapper/Apex) in the container graphics settings.
 2. Run a BC-heavy game (GTA V, Skyrim SE, Dark Souls 3).
-3. Set `DXVK_LOG_LEVEL=info` and collect the full `d3d11.log`.
+3. Use a debug build with `DXVK_LOG_LEVEL=debug` and collect the full `d3d11.log`.
 4. Confirm `textureCompressionBC = 0` and `panDXVK: BC` transcode lines in the log.
 
 Without this, no log currently proves BC→ASTC works on real hardware.
