@@ -27,7 +27,8 @@ namespace dxvk {
     // Skip if the driver already supports BC (blob driver on G610+).
     VkFormat astcFormat = VK_FORMAT_UNDEFINED;
     if (m_device->GetDXVKDevice()->adapter()->isPanVk()
-        && !m_device->GetDXVKDevice()->adapter()->features().core.features.textureCompressionBC
+        && (util::forceTranscodeEnabled()
+            || !m_device->GetDXVKDevice()->adapter()->features().core.features.textureCompressionBC)
         && util::isBcFormat(m_desc.Format)) {
       astcFormat = util::bcToAstcFormat(m_desc.Format);
       if (astcFormat != VK_FORMAT_UNDEFINED) {
