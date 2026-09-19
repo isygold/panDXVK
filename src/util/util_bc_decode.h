@@ -24,16 +24,30 @@ namespace dxvk::util {
    * \param [out] pixels    Output 4x4 RGBA8 pixel buffer (16 bytes)
    */
   // Helper: extract N bits from a bitstream starting at startBit (LSB order)
+  // Word-level implementation: one 64-bit load + shift/mask per field
+  // instead of a per-bit loop. Requires little-endian host (all ARM64
+  // Android and x86_64 build targets). Callers use numBits <= 16.
   inline uint32_t extractBits(const uint8_t* block, int startBit, int numBits) {
-    uint32_t result = 0;
-    for (int i = 0; i < numBits; i++) {
-      int bitPos = startBit + i;
-      int byteIdx = bitPos / 8;
-      int bitIdx  = bitPos % 8;
-      if (block[byteIdx] & (1 << bitIdx))
-        result |= (1 << i);
-    }
-    return result;
+    static_assert(__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__,
+      "extractBits requires a little-endian host");
+    if (numBits <= 0)
+      return 0;
+    uint64_t lo = 0, hi = 0;
+    std::memcpy(&lo, block, 8);
+    std::memcpy(&hi, block + 8, 8);
+    const uint32_t mask = (numBits >= 32)
+      ? 0xFFFFFFFFu
+      : ((1u << (unsigned)numBits) - 1u);
+    if (startBit + numBits <= 64)
+      return (uint32_t)((lo >> (unsigned)startBit) & mask);
+    if (startBit >= 64)
+      return (uint32_t)((hi >> (unsigned)(startBit - 64)) & mask);
+    // Spans the 64-bit boundary. With numBits <= 32 this implies
+    // startBit > 32, so the low part holds fewer than 32 bits.
+    const unsigned loBits = (unsigned)(64 - startBit);
+    const uint32_t loPart = (uint32_t)(lo >> (unsigned)startBit);
+    const uint32_t hiPart = (uint32_t)(hi & (mask >> loBits));
+    return (loPart | (hiPart << loBits)) & mask;
   }
 
   // BC7 weight tables (from Khronos spec / bc7enc reference)
@@ -1246,11 +1260,14 @@ namespace dxvk::util {
     uint32_t blockWidth  = (width + 3) / 4;
     uint32_t blockHeight = (height + 3) / 4;
 
+    // Hoisted out of the per-block loop (loop-invariant).
+    const uint32_t blockSizeBytes =
+      (bcFormat == BcFormat::BC1 || bcFormat == BcFormat::BC4) ? 8 : 16;
+
     uint32_t srcBlockPitch;
     if (srcRowPitch > 0) {
       srcBlockPitch = static_cast<uint32_t>(srcRowPitch);
     } else {
-      uint32_t blockSizeBytes = (bcFormat == BcFormat::BC1 || bcFormat == BcFormat::BC4) ? 8 : 16;
       srcBlockPitch = blockWidth * blockSizeBytes;
     }
 
@@ -1261,7 +1278,7 @@ namespace dxvk::util {
 
     for (uint32_t by = 0; by < blockHeight; by++) {
       for (uint32_t bx = 0; bx < blockWidth; bx++) {
-        const uint8_t* block = srcData + static_cast<VkDeviceSize>(by) * srcBlockPitch + bx * ((bcFormat == BcFormat::BC1 || bcFormat == BcFormat::BC4) ? 8 : 16);
+        const uint8_t* block = srcData + static_cast<VkDeviceSize>(by) * srcBlockPitch + bx * blockSizeBytes;
 
         decodeBcBlock(bcFormat, block, blockPixels);
 
