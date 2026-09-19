@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <algorithm>
 #include <memory>
@@ -9,6 +10,22 @@
 #include "util_astc_encode.h"
 
 namespace dxvk::util {
+
+  /**
+   * \brief Test-build override: force BC→ASTC even when the driver
+   * claims BC support (e.g. wrapper BCN layer faking the feature).
+   *
+   * Opt-in via PANDXVK_FORCE_TRANSCODE=1 (any value except unset/empty/"0").
+   * Explicitly a testing knob: forcing transcode adds CPU cost + ASTC loss
+   * on setups where the wrapper path renders fine. Cached on first call.
+   */
+  inline bool forceTranscodeEnabled() {
+    static const bool enabled = [] {
+      const char* v = std::getenv("PANDXVK_FORCE_TRANSCODE");
+      return v != nullptr && v[0] != '\0' && !(v[0] == '0' && v[1] == '\0');
+    }();
+    return enabled;
+  }
 
   /**
    * \brief Checks if a DXGI format is a BC compressed format
