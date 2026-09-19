@@ -3728,7 +3728,8 @@ namespace dxvk {
 
     if (util::isBcFormat(packedFormat)
         && m_device->adapter()->isPanVk()
-        && !m_device->features().core.features.textureCompressionBC) {
+        && (util::forceTranscodeEnabled()
+            || !m_device->features().core.features.textureCompressionBC)) {
       // Use the actual update extent (pDstBox subregion or full mip level)
 #ifndef NDEBUG
       auto t0 = std::chrono::high_resolution_clock::now();
@@ -3745,6 +3746,16 @@ namespace dxvk {
           extent.width, "x", extent.height, " ",
           "DXGI_FORMAT=", packedFormat, " sub=", DstSubresource));
         return;
+      }
+
+      // One-time activation notice (fires once per process): proves the
+      // forced path is live in tester logs. Deliberately INFO, not debug.
+      if (util::forceTranscodeEnabled()) {
+        static bool announced = false;
+        if (!announced) {
+          announced = true;
+          Logger::info("panDXVK: PANDXVK_FORCE_TRANSCODE=1, BC->ASTC forced on (test mode, expect CPU overhead)");
+        }
       }
 
 #ifndef NDEBUG
