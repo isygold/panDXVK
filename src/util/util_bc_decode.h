@@ -4,9 +4,8 @@
 #include <cstring>
 #include <algorithm>
 
-#ifndef NDEBUG
-#include <cstdio>
-#endif
+#include "log/log.h"
+#include "util_string.h"
 
 namespace dxvk::util {
 
@@ -240,17 +239,17 @@ namespace dxvk::util {
     }
 
     void dump() const {
-#ifndef NDEBUG
-      fprintf(stderr, "[panDXVK] BC7 decode stats: total=%u\n", totalBlocks);
+      // INFO-level by design (testing mode): visible in release builds
+      // so BC7 mode distribution can be checked from tester d3d11.log files.
+      Logger::info(str::format("[panDXVK] BC7 decode stats: total=", totalBlocks));
       for (int i = 0; i < 8; i++) {
-        if (modeCounts[i])
-          fprintf(stderr, "  mode %d: %u blocks (%.1f%%)\n",
-                  i, modeCounts[i],
-                  totalBlocks ? 100.0 * modeCounts[i] / totalBlocks : 0.0);
+        if (modeCounts[i]) {
+          double pct = totalBlocks ? 100.0 * modeCounts[i] / totalBlocks : 0.0;
+          Logger::info(str::format("  mode ", i, ": ", modeCounts[i], " blocks (", pct, "%)"));
+        }
       }
       if (unhandledBlocks)
-        fprintf(stderr, "  unhandled: %u blocks\n", unhandledBlocks);
-#endif
+        Logger::info(str::format("  unhandled: ", unhandledBlocks, " blocks"));
     }
   };
 
@@ -596,11 +595,9 @@ namespace dxvk::util {
           }
         }
 
-#ifndef NDEBUG
         bc7Stats().totalBlocks++;
         if (mode >= 0 && mode < 8)
           bc7Stats().modeCounts[mode]++;
-#endif
 
         if (mode == 6) {
           // Mode 6: 1 subset, RGBAP 7.7.7.7.1 endpoints, 16×4-bit indices
@@ -1171,9 +1168,7 @@ namespace dxvk::util {
 
         } else {
           // Unknown mode (should not happen with valid BC7 data)
-#ifndef NDEBUG
           bc7Stats().unhandledBlocks++;
-#endif
           for (int i = 0; i < 16; i++) {
             pixels[i * 4 + 0] = 255;
             pixels[i * 4 + 1] = 0;
