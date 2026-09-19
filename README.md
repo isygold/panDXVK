@@ -67,6 +67,20 @@ So:
 The fix:
 panDXVK should NOT rely on the wrapper. It should always do the software BC→ASTC transcode when on Mali, regardless of what the wrapper says.
 
+## Validation Status (TO-DO 1)
+
+Tested so far — all with wrapper active (`textureCompressionBC = 1`, transcode skipped):
+- AIO Graphics Test on Mali-G615 (PanVK 26.2.99 and blob 44.1.0) and Mali-G720 — init parity only.
+- 70 FPS panDXVK vs 51 FPS stock DXVK on AIO spin-cube (non-BC test, Us5rman).
+
+Still missing — the one test that proves the transcode path:
+1. Select the raw PanVK driver entry (not Wrapper/Apex) in the container graphics settings.
+2. Run a BC-heavy game (GTA V, Skyrim SE, Dark Souls 3).
+3. Set `DXVK_LOG_LEVEL=info` and collect the full `d3d11.log`.
+4. Confirm `textureCompressionBC = 0` and `panDXVK: BC` transcode lines in the log.
+
+Without this, no log currently proves BC→ASTC works on real hardware.
+
 ## Upstream Reference
 - Upstream DXVK: [doitsujin/dxvk](https://github.com/doitsujin/dxvk)
 - DXVK Sarek: [pythonlover02/dxvk-sarek](https://github.com/pythonlover02/dxvk-sarek)
