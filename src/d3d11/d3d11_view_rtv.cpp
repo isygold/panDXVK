@@ -32,7 +32,8 @@ namespace dxvk {
 
     // panDXVK: Remap BC→ASTC format for PanVK RTV image views
     if (pDevice->GetDXVKDevice()->adapter()->isPanVk()
-        && !pDevice->GetDXVKDevice()->adapter()->features().core.features.textureCompressionBC
+        && (util::forceTranscodeEnabled()
+            || !pDevice->GetDXVKDevice()->adapter()->features().core.features.textureCompressionBC)
         && util::isBcFormat(pDesc->Format)) {
       VkFormat astcFormat = util::bcToAstcFormat(pDesc->Format);
       if (astcFormat != VK_FORMAT_UNDEFINED) {
