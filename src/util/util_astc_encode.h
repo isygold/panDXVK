@@ -51,17 +51,47 @@ namespace dxvk::util {
    * \param [in]     value      Value to write
    * \param [in]     numBits    Number of bits to write
    */
+  // Word-level implementation: read-modify-write on 64-bit words instead
+  // of a per-bit loop. Requires little-endian host. Preserves OR-into-
+  // existing-bits semantics (block starts zeroed, writes never overlap).
   inline void writeBits(
           uint8_t*       block,
           uint32_t       bitOffset,
           uint32_t       value,
           uint32_t       numBits) {
-    for (uint32_t i = 0; i < numBits; i++) {
-      uint32_t bitPos = bitOffset + i;
-      uint32_t byteIdx = bitPos / 8;
-      uint32_t bitIdx  = bitPos % 8;
-      if (value & (1u << i))
-        block[byteIdx] |= (1u << bitIdx);
+    static_assert(__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__,
+      "writeBits requires a little-endian host");
+    if (numBits == 0)
+      return;
+    const uint32_t mask = (numBits >= 32)
+      ? 0xFFFFFFFFu
+      : ((1u << numBits) - 1u);
+    value &= mask;
+    const uint32_t endBit = bitOffset + numBits;
+    if (endBit <= 64) {
+      uint64_t w = 0;
+      std::memcpy(&w, block, 8);
+      w |= (uint64_t)value << bitOffset;
+      std::memcpy(block, &w, 8);
+    } else if (bitOffset >= 64) {
+      uint64_t w = 0;
+      std::memcpy(&w, block + 8, 8);
+      w |= (uint64_t)value << (bitOffset - 64);
+      std::memcpy(block + 8, &w, 8);
+    } else {
+      // Spans the 64-bit boundary. With numBits <= 32 this implies
+      // bitOffset > 32, so the low part holds fewer than 32 bits.
+      const uint32_t loBits = 64 - bitOffset;
+      const uint32_t loMask = (loBits >= 32)
+        ? 0xFFFFFFFFu
+        : ((1u << loBits) - 1u);
+      uint64_t lo = 0, hi = 0;
+      std::memcpy(&lo, block, 8);
+      std::memcpy(&hi, block + 8, 8);
+      lo |= (uint64_t)(value & loMask) << bitOffset;
+      hi |= (uint64_t)value >> loBits;
+      std::memcpy(block, &lo, 8);
+      std::memcpy(block + 8, &hi, 8);
     }
   }
 
