@@ -88,8 +88,10 @@ namespace dxvk {
           && util::isBcFormat(pDesc->Format)) {
         VkFormat astcFormat = util::bcToAstcFormat(pDesc->Format);
         if (astcFormat != VK_FORMAT_UNDEFINED) {
-          Logger::info(str::format(
-            "panDXVK: SRV BC\u2192ASTC DXGI_FORMAT=", pDesc->Format));
+#ifndef NDEBUG
+          Logger::debug(str::format(
+            "panDXVK: SRV BC→ASTC DXGI_FORMAT=", pDesc->Format));
+#endif
           viewInfo.format = astcFormat;
         }
       }
