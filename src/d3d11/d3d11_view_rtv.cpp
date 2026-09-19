@@ -36,8 +36,10 @@ namespace dxvk {
         && util::isBcFormat(pDesc->Format)) {
       VkFormat astcFormat = util::bcToAstcFormat(pDesc->Format);
       if (astcFormat != VK_FORMAT_UNDEFINED) {
-        Logger::info(str::format(
-          "panDXVK: RTV BC\u2192ASTC DXGI_FORMAT=", pDesc->Format));
+#ifndef NDEBUG
+        Logger::debug(str::format(
+          "panDXVK: RTV BC→ASTC DXGI_FORMAT=", pDesc->Format));
+#endif
         viewInfo.format = astcFormat;
         viewInfo.aspect = imageFormatInfo(astcFormat)->aspectMask;
       }
