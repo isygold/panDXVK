@@ -257,15 +257,15 @@ namespace dxvk::util {
     decodeBcImage(bc, srcData, width, height, srcRowPitch,
                   rgbaData.get(), width * 4);
 
-#ifndef NDEBUG
-    // Log BC7 decode stats periodically (every 1000th call)
+    // Log BC7 decode stats at INFO periodically (every 1000th call).
+    // INFO by design (testing mode): visible in release builds so tester
+    // d3d11.log files show the BC7 mode distribution.
     if (bc == BcFormat::BC7) {
       static uint32_t callCount = 0;
       if (++callCount % 1000 == 0) {
         bc7Stats().dump();
       }
     }
-#endif
 
     // Step 1.5: SNORM remap for BC4/BC5
     // BC4_SNORM/BC5_SNORM store signed normalized values ([-1,1]) as
