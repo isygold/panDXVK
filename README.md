@@ -39,12 +39,13 @@ panDXVK uses the same configuration mechanism as upstream DXVK. Set `DXVK_CONFIG
 | `DXVK_LOG_LEVEL` | `none`, `error`, `warn`, `info`, `debug` | Logging verbosity. Transcode diagnostics need a debug build + `debug` level. |
 | `DXVK_LOG_PATH` | path | Directory for log files. |
 | `DXVK_FRAME_RATE` | `0` (uncap), or FPS limit | Frame rate cap. |
+| `PANDXVK_FORCE_TRANSCODE` | `0`, `1` | Test knob: force BC→ASTC on Mali even when the driver claims BC (wrapper setups). Explicit CPU overhead. Needs game restart. |
 
 ## Notes
 - **I need your logs.** If you hit a crash, rendering glitch, or anything weird, grab the log file from your Wine prefix's drive_c (usually `wine_debug.log` or `d3d11.log` in the app directory) and paste it to [panDXVK Logs](https://github.com/isygold/panDXVK-logs/issues). For BC→ASTC transcode diagnostics you need a debug build with `DXVK_LOG_LEVEL=debug`. Without logs, I cannot help you.
 - **ASTC 4x4 is lossy.** BC1–BC7 textures are decoded to RGBA8 and re-encoded to ASTC 4x4. This introduces compression artifacts not present in the original. For most games the visual difference is minimal, but texture-heavy UIs or screenshots may show subtle banding.
-- **BC6H maps to ASTC 6x6 LDR.** BC6H (HDR float RGB) is approximated as ASTC 6x6 UNORM. Full HDR fidelity is not preserved.
-- **PanVK must be the active Vulkan driver.** panDXVK detects Mali via vendor ID `0x13B5`. If you are running a blob driver that already reports `textureCompressionBC = true`, the transcode is skipped entirely — the game's BC textures are uploaded as-is.
+- **BC6H maps to ASTC 4x4 LDR.** BC6H (HDR float RGB) is clamped (negatives/NaN to 0, highlights saturate) and approximated as ASTC 4x4 UNORM. Full HDR fidelity is not preserved.
+- **PanVK must be the active Vulkan driver.** panDXVK detects Mali via vendor ID `0x13B5`. If you are running a blob driver that already reports `textureCompressionBC = true`, the transcode is skipped entirely — the game's BC textures are uploaded as-is. Set `PANDXVK_FORCE_TRANSCODE=1` to force the transcode anyway (test mode, expect CPU overhead).
 - **Transcode happens at CPU time.** Each `UpdateTexture` call triggers a full BC decode + ASTC encode on the CPU. Large textures (4K+) may take 10–30ms per subresource on mobile CPUs. This is a one-time cost per texture load, not per frame.
 - **TBDR architecture.** Mali is a tile-based deferred renderer. ASTC textures are natively supported by the tile buffer. No special TBDR handling is needed for the transcode path — the ASTC data is uploaded via standard `vkCmdCopyBufferToImage` and decoded by the texture unit before fragment processing.
 - **AppendSlice path not yet patched.** The `AppendSlice` D3D11 path may also encounter BC textures. This is a known gap. If you see BC format errors in `AppendSlice`, file an issue.
@@ -78,13 +79,11 @@ Current state:
 - Real Mali hardware has no BC support (verified: gpuinfo + leegao unsupported-device list) — the `= 1` in tester logs comes from the wrapper layer.
 - Transcode hot spots optimized: word-level bit extract/insert, verified bit-identical over 12,298 on-device checks.
 
-Still missing — the one test that proves the transcode path:
-1. Select the raw PanVK driver entry (not Wrapper/Apex) in the container graphics settings.
-2. Run a BC-heavy game (GTA V, Skyrim SE, Dark Souls 3).
-3. Use a debug build with `DXVK_LOG_LEVEL=debug` and collect the full `d3d11.log`.
-4. Confirm `textureCompressionBC = 0` and `panDXVK: BC` transcode lines in the log.
+Still missing — the one test that proves the transcode path (two options):
+- Wrapper-free: select the raw PanVK driver entry (not Wrapper/Apex), run a BC-heavy game (GTA V, Skyrim SE, Dark Souls 3), confirm `textureCompressionBC = 0` in `d3d11.log`.
+- Forced (release build OK): set `PANDXVK_FORCE_TRANSCODE=1`, run any BC-heavy game on any Mali setup, confirm `textureCompressionBC = 1` (wrapper active) plus the one-time `PANDXVK_FORCE_TRANSCODE` notice — proving the forced path fired where it previously skipped.
 
-Without this, no log currently proves BC→ASTC works on real hardware.
+Without one of these, no log currently proves BC→ASTC works on real hardware.
 
 ## Upstream Reference
 - Upstream DXVK: [doitsujin/dxvk](https://github.com/doitsujin/dxvk)
