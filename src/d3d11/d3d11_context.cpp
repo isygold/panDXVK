@@ -3730,29 +3730,37 @@ namespace dxvk {
         && m_device->adapter()->isPanVk()
         && !m_device->features().core.features.textureCompressionBC) {
       // Use the actual update extent (pDstBox subregion or full mip level)
+#ifndef NDEBUG
       auto t0 = std::chrono::high_resolution_clock::now();
+#endif
 
       astcData = util::transcodeBcToAstcAlloc(
         packedFormat, static_cast<const uint8_t*>(pSrcData),
         extent.width, extent.height,
         SrcRowPitch);
 
-      auto t1 = std::chrono::high_resolution_clock::now();
-      double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-
       if (!astcData) {
         Logger::err(str::format(
-          "panDXVK: BC\u2192ASTC transcode FAILED ",
+          "panDXVK: BC→ASTC transcode FAILED ",
           extent.width, "x", extent.height, " ",
           "DXGI_FORMAT=", packedFormat, " sub=", DstSubresource));
         return;
       }
 
-      Logger::info(str::format(
-        "panDXVK: BC\u2192ASTC transcode ",
+#ifndef NDEBUG
+      // Debug-gated by design: per-upload timing + logging is pure CPU
+      // overhead (chrono + heap string build + log I/O). Release builds
+      // skip it entirely since wrappers now carry the BCN layer and the
+      // transcode path is dormant behind the feature gate.
+      auto t1 = std::chrono::high_resolution_clock::now();
+      double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+      Logger::debug(str::format(
+        "panDXVK: BC→ASTC transcode ",
         extent.width, "x", extent.height, " ",
         "DXGI_FORMAT=", packedFormat, " sub=", DstSubresource,
         " ", ms, "ms"));
+#endif
 
       // Override src data + format for the staging buffer path below.
       pSrcData = astcData.get();
