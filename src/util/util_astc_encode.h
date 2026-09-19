@@ -223,16 +223,19 @@ namespace dxvk::util {
       for (int i = 0; i < 16; i++)
         weightBits[i] = 0;
     } else {
-      float invRange = 1.0f / std::sqrt(rangeSq);
+      // Project each pixel onto the min→max axis: t = dot(d, range)/|range|²,
+      // clamped to [0,1]. Strictly more accurate than distance-from-min
+      // (off-axis pixels no longer overshoot toward max) and cheaper
+      // (no sqrt per pixel, one reciprocal per block).
+      float invRangeSq = 1.0f / rangeSq;
 
       for (int i = 0; i < 16; i++) {
         float dr = static_cast<float>(pixels[i * 4 + 0]) - minR;
         float dg = static_cast<float>(pixels[i * 4 + 1]) - minG;
         float db = static_cast<float>(pixels[i * 4 + 2]) - minB;
         float da = static_cast<float>(pixels[i * 4 + 3]) - minA;
-
-        float dist = std::sqrt(dr * dr + dg * dg + db * db + da * da);
-        float t = dist * invRange;  // t ∈ [0, 1]
+        float t = (dr * rangeR + dg * rangeG + db * rangeB + da * rangeA) * invRangeSq;
+        t = t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t);
 
         // Quantize to 2 bits: 0, 1, 2, 3
         weightBits[i] = quantizeWeight(t, 2);
