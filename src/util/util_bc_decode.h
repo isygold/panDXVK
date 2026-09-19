@@ -287,54 +287,72 @@ namespace dxvk::util {
       return static_cast<uint8_t>((v << 3) | (v >> 2));
     };
 
-    // Helper: interpolate between two colors
-    auto lerp565 = [expand5, expand6](uint16_t c0, uint16_t c1, uint32_t t) -> uint32_t {
-      uint32_t r0 = (c0 >> 11) & 0x1F;
-      uint32_t g0 = (c0 >> 5)  & 0x3F;
-      uint32_t b0 =  c0        & 0x1F;
-      uint32_t r1 = (c1 >> 11) & 0x1F;
-      uint32_t g1 = (c1 >> 5)  & 0x3F;
-      uint32_t b1 =  c1        & 0x1F;
-      uint32_t r = (r0 * (8 - t) + r1 * t) / 8;
-      uint32_t g = (g0 * (8 - t) + g1 * t) / 8;
-      uint32_t b = (b0 * (8 - t) + b1 * t) / 8;
-      return (expand5(r)) | (expand6(g) << 8) | (expand5(b) << 16) | (0xFFu << 24);
+    // Helper: build the 4-entry BC1 color palette (spec-correct).
+    // fourColor=true: [c0, c1, (2c0+c1)/3, (c0+2c1)/3], all opaque.
+    // fourColor=false: [c0, c1, (c0+c1)/2, transparent black].
+    // BC1 passes (c0 > c1); BC2/BC3 color always passes true.
+    auto bc1Palette = [expand5, expand6](uint16_t c0, uint16_t c1,
+                                         bool fourColor, uint8_t pal[4][4]) {
+      uint8_t e0[4] = { expand5((c0 >> 11) & 0x1F), expand6((c0 >> 5) & 0x3F),
+                        expand5(c0 & 0x1F), 255 };
+      uint8_t e1[4] = { expand5((c1 >> 11) & 0x1F), expand6((c1 >> 5) & 0x3F),
+                        expand5(c1 & 0x1F), 255 };
+      std::memcpy(pal[0], e0, 4);
+      std::memcpy(pal[1], e1, 4);
+      if (fourColor) {
+        for (int c = 0; c < 3; c++) {
+          pal[2][c] = static_cast<uint8_t>((2 * e0[c] + e1[c]) / 3);
+          pal[3][c] = static_cast<uint8_t>((e0[c] + 2 * e1[c]) / 3);
+        }
+        pal[2][3] = 255;
+        pal[3][3] = 255;
+      } else {
+        for (int c = 0; c < 3; c++)
+          pal[2][c] = static_cast<uint8_t>((e0[c] + e1[c]) / 2);
+        pal[2][3] = 255;
+        pal[3][0] = pal[3][1] = pal[3][2] = pal[3][3] = 0;
+      }
     };
 
-    // Helper: interpolate two RGBA8 colors
-    auto lerpRgba = [](const uint8_t* c0, const uint8_t* c1, uint32_t t) -> uint32_t {
-      uint32_t r = (c0[0] * (256 - t) + c1[0] * t) / 256;
-      uint32_t g = (c0[1] * (256 - t) + c1[1] * t) / 256;
-      uint32_t b = (c0[2] * (256 - t) + c1[2] * t) / 256;
-      uint32_t a = (c0[3] * (256 - t) + c1[3] * t) / 256;
-      return r | (g << 8) | (b << 16) | (a << 24);
+    // Helper: decode one 8-byte BC4 block to 16 channel values
+    // (spec-correct palette: /7 eight-value when e0>e1,
+    // /5 six-value + 0/255 otherwise; 3-bit indices packed LSB-first).
+    // Doubles as the BC3 alpha decoder (BC3 alpha IS a BC4 block).
+    auto decodeBc4Channel = [](const uint8_t* blk, uint8_t out[16]) {
+      const uint8_t e0 = blk[0], e1 = blk[1];
+      uint8_t pal[8];
+      pal[0] = e0;
+      pal[1] = e1;
+      if (e0 > e1) {
+        for (int k = 2; k < 8; k++)
+          pal[k] = static_cast<uint8_t>(((8 - k) * e0 + (k - 1) * e1) / 7);
+      } else {
+        for (int k = 2; k < 6; k++)
+          pal[k] = static_cast<uint8_t>(((6 - k) * e0 + (k - 1) * e1) / 5);
+        pal[6] = 0;
+        pal[7] = 255;
+      }
+      uint64_t idx = 0;
+      for (int i = 0; i < 6; i++)
+        idx |= static_cast<uint64_t>(blk[2 + i]) << (8 * i);
+      for (int i = 0; i < 16; i++)
+        out[i] = pal[(idx >> (3 * i)) & 7];
     };
 
     switch (bcFormat) {
       case BcFormat::BC1: {
-        // BC1: 8 bytes per block, 4x4 pixels, 1-bit alpha or opaque
+        // BC1: 8 bytes per block. c0 > c1 selects 4-opaque-color mode,
+        // c0 <= c1 selects 3-color + transparent mode.
         uint16_t c0 = block[0] | (block[1] << 8);
         uint16_t c1 = block[2] | (block[3] << 8);
         uint32_t indices = block[4] | (block[5] << 8) | (block[6] << 16) | (block[7] << 24);
 
-        bool hasAlpha = c0 <= c1;
-        uint32_t colors[4];
-        colors[0] = lerp565(c0, c1, 0);
-        colors[1] = lerp565(c0, c1, 2);
-        colors[2] = lerp565(c0, c1, 3);
-        if (hasAlpha) {
-          colors[3] = 0x00000000; // transparent black
-        } else {
-          colors[3] = lerp565(c0, c1, 1);
-        }
+        uint8_t colors[4][4];
+        bc1Palette(c0, c1, c0 > c1, colors);
 
         for (int i = 0; i < 16; i++) {
           uint32_t idx = (indices >> (2 * i)) & 3;
-          uint32_t rgba = colors[idx];
-          pixels[i * 4 + 0] = (rgba)       & 0xFF;
-          pixels[i * 4 + 1] = (rgba >> 8)  & 0xFF;
-          pixels[i * 4 + 2] = (rgba >> 16) & 0xFF;
-          pixels[i * 4 + 3] = (rgba >> 24) & 0xFF;
+          std::memcpy(pixels + i * 4, colors[idx], 4);
         }
         break;
       }
@@ -346,29 +364,21 @@ namespace dxvk::util {
         uint32_t colorIndices = block[12] | (block[13] << 8)
                               | (block[14] << 16) | (block[15] << 24);
 
-        uint32_t colors[4];
-        colors[0] = lerp565(c0, c1, 0);
-        colors[1] = lerp565(c0, c1, 2);
-        colors[2] = lerp565(c0, c1, 3);
-        colors[3] = lerp565(c0, c1, 1);
+        // BC2 color is always 4-opaque-color (no endpoint comparison).
+        uint8_t colors[4][4];
+        bc1Palette(c0, c1, true, colors);
 
-        // Alpha: 2 bytes of 4-bit alpha per row
+        // Alpha: bytes 0..7, two 4-bit nibbles per byte, pixel i in byte[i/2].
         for (int i = 0; i < 16; i++) {
           uint32_t ci = (colorIndices >> (2 * i)) & 3;
-          uint32_t rgba = colors[ci];
 
-          // Extract 4-bit alpha: block[0..7], each byte holds 2 pixels
-          uint32_t alphaBits;
-          if (i < 8)
-            alphaBits = (block[i / 2] >> (4 * (i % 2))) & 0xF;
-          else
-            alphaBits = (block[8 + (i - 8) / 2] >> (4 * ((i - 8) % 2))) & 0xF;
+          uint32_t alphaBits = (block[i / 2] >> (4 * (i % 2))) & 0xF;
 
           uint32_t alpha = alphaBits | (alphaBits << 4);
-          pixels[i * 4 + 0] = (rgba)       & 0xFF;
-          pixels[i * 4 + 1] = (rgba >> 8)  & 0xFF;
-          pixels[i * 4 + 2] = (rgba >> 16) & 0xFF;
-          pixels[i * 4 + 3] = alpha;
+          pixels[i * 4 + 0] = colors[ci][0];
+          pixels[i * 4 + 1] = colors[ci][1];
+          pixels[i * 4 + 2] = colors[ci][2];
+          pixels[i * 4 + 3] = static_cast<uint8_t>(alpha);
         }
         break;
       }
@@ -380,89 +390,33 @@ namespace dxvk::util {
         uint32_t colorIndices = block[12] | (block[13] << 8)
                               | (block[14] << 16) | (block[15] << 24);
 
-        uint32_t colors[4];
-        colors[0] = lerp565(c0, c1, 0);
-        colors[1] = lerp565(c0, c1, 2);
-        colors[2] = lerp565(c0, c1, 3);
-        colors[3] = lerp565(c0, c1, 1);
+        // BC3 color is always 4-opaque-color (no endpoint comparison).
+        uint8_t colors[4][4];
+        bc1Palette(c0, c1, true, colors);
 
-        // Decode 8-bit alpha from block[0..7]
-        uint8_t alphaBlock[16];
-        uint8_t alpha0 = block[0];
-        uint8_t alpha1 = block[1];
-        alphaBlock[0]  = alpha0;
-        alphaBlock[1]  = alpha1;
-
-        if (alpha0 > alpha1) {
-          for (int i = 1; i < 7; i++) {
-            uint8_t bits = (block[2 + i / 2] >> (3 * (i % 2))) & 0x7;
-            alphaBlock[i + 1] = static_cast<uint8_t>(
-              ((7 - bits) * alpha0 + bits * alpha1) / 7);
-          }
-          alphaBlock[7] = 0;
-          for (int i = 0; i < 8; i++) {
-            uint8_t bits = (block[2 + (i + 6) / 2] >> (3 * ((i + 6) % 2))) & 0x7;
-            alphaBlock[i + 8] = static_cast<uint8_t>(
-              ((7 - bits) * alpha0 + bits * alpha1) / 7);
-          }
-          alphaBlock[15] = 255;
-        } else {
-          for (int i = 1; i < 5; i++) {
-            uint8_t bits = (block[2 + i / 2] >> (3 * (i % 2))) & 0x7;
-            alphaBlock[i + 1] = static_cast<uint8_t>(
-              ((5 - bits) * alpha0 + bits * alpha1) / 5);
-          }
-          alphaBlock[5] = 0;
-          alphaBlock[6] = 255;
-          for (int i = 0; i < 9; i++) {
-            uint8_t bits = (block[2 + (i + 4) / 2] >> (3 * ((i + 4) % 2))) & 0x7;
-            alphaBlock[i + 7] = static_cast<uint8_t>(
-              ((5 - bits) * alpha0 + bits * alpha1) / 5);
-          }
-        }
+        // BC3 alpha block (bytes 0..7) IS a BC4 block.
+        uint8_t alphaVals[16];
+        decodeBc4Channel(block, alphaVals);
 
         for (int i = 0; i < 16; i++) {
           uint32_t ci = (colorIndices >> (2 * i)) & 3;
-          uint32_t rgba = colors[ci];
-          pixels[i * 4 + 0] = (rgba)       & 0xFF;
-          pixels[i * 4 + 1] = (rgba >> 8)  & 0xFF;
-          pixels[i * 4 + 2] = (rgba >> 16) & 0xFF;
-          pixels[i * 4 + 3] = alphaBlock[i];
+          pixels[i * 4 + 0] = colors[ci][0];
+          pixels[i * 4 + 1] = colors[ci][1];
+          pixels[i * 4 + 2] = colors[ci][2];
+          pixels[i * 4 + 3] = alphaVals[i];
         }
         break;
       }
 
       case BcFormat::BC4: {
-        // BC4: 8 bytes per block, single-channel (R8)
-        uint8_t r0 = block[0];
-        uint8_t r1 = block[1];
-        uint8_t reds[8];
-
-        if (r0 > r1) {
-          reds[0] = r0;
-          reds[1] = r1;
-          for (int i = 0; i < 6; i++) {
-            uint8_t bits = (block[2 + i / 2] >> (3 * (i % 2))) & 0x7;
-            reds[i + 2] = static_cast<uint8_t>(((6 - bits) * r0 + bits * r1) / 6);
-          }
-        } else {
-          reds[0] = r0;
-          reds[1] = r1;
-          for (int i = 0; i < 4; i++) {
-            uint8_t bits = (block[2 + i / 2] >> (3 * (i % 2))) & 0x7;
-            reds[i + 2] = static_cast<uint8_t>(((4 - bits) * r0 + bits * r1) / 4);
-          }
-          reds[6] = 0;
-          reds[7] = 255;
-        }
-
-        uint64_t indices = 0;
-        for (int i = 2; i < 8; i++)
-          indices |= static_cast<uint64_t>(block[i]) << (8 * (i - 2));
+        // BC4: 8 bytes per block, single-channel (R8). Others set to
+        // replicate the channel (G, B) and opaque alpha, matching how
+        // games sample .r/.g lookups from BC4 textures.
+        uint8_t chan[16];
+        decodeBc4Channel(block, chan);
 
         for (int i = 0; i < 16; i++) {
-          uint32_t idx = (indices >> (3 * i)) & 7;
-          uint8_t r = reds[idx];
+          uint8_t r = chan[i];
           pixels[i * 4 + 0] = r;
           pixels[i * 4 + 1] = r;
           pixels[i * 4 + 2] = r;
@@ -472,59 +426,10 @@ namespace dxvk::util {
       }
 
       case BcFormat::BC5: {
-        // BC5: 16 bytes per block, two-channel (RG8)
-        // Decode two BC4 blocks
+        // BC5: 16 bytes per block, two-channel (RG8) = two BC4 blocks.
         uint8_t blockR[16], blockG[16];
-
-        // Red channel
-        {
-          uint8_t r0 = block[0], r1 = block[1];
-          uint8_t reds[8];
-          if (r0 > r1) {
-            reds[0] = r0; reds[1] = r1;
-            for (int i = 0; i < 6; i++) {
-              uint8_t bits = (block[2 + i / 2] >> (3 * (i % 2))) & 0x7;
-              reds[i + 2] = static_cast<uint8_t>(((6 - bits) * r0 + bits * r1) / 6);
-            }
-          } else {
-            reds[0] = r0; reds[1] = r1;
-            for (int i = 0; i < 4; i++) {
-              uint8_t bits = (block[2 + i / 2] >> (3 * (i % 2))) & 0x7;
-              reds[i + 2] = static_cast<uint8_t>(((4 - bits) * r0 + bits * r1) / 4);
-            }
-            reds[6] = 0; reds[7] = 255;
-          }
-          uint64_t indices = 0;
-          for (int i = 2; i < 8; i++)
-            indices |= static_cast<uint64_t>(block[i]) << (8 * (i - 2));
-          for (int i = 0; i < 16; i++)
-            blockR[i] = reds[(indices >> (3 * i)) & 7];
-        }
-
-        // Green channel
-        {
-          uint8_t r0 = block[8], r1 = block[9];
-          uint8_t reds[8];
-          if (r0 > r1) {
-            reds[0] = r0; reds[1] = r1;
-            for (int i = 0; i < 6; i++) {
-              uint8_t bits = (block[10 + i / 2] >> (3 * (i % 2))) & 0x7;
-              reds[i + 2] = static_cast<uint8_t>(((6 - bits) * r0 + bits * r1) / 6);
-            }
-          } else {
-            reds[0] = r0; reds[1] = r1;
-            for (int i = 0; i < 4; i++) {
-              uint8_t bits = (block[10 + i / 2] >> (3 * (i % 2))) & 0x7;
-              reds[i + 2] = static_cast<uint8_t>(((4 - bits) * r0 + bits * r1) / 4);
-            }
-            reds[6] = 0; reds[7] = 255;
-          }
-          uint64_t indices = 0;
-          for (int i = 2; i < 8; i++)
-            indices |= static_cast<uint64_t>(block[8 + i]) << (8 * (i - 2));
-          for (int i = 0; i < 16; i++)
-            blockG[i] = reds[(indices >> (3 * i)) & 7];
-        }
+        decodeBc4Channel(block, blockR);
+        decodeBc4Channel(block + 8, blockG);
 
         for (int i = 0; i < 16; i++) {
           pixels[i * 4 + 0] = blockR[i];
