@@ -613,44 +613,23 @@ namespace dxvk::util {
           // Subset 0 anchor = pixel 0 (always), subset 1 anchor = table lookup
           // Total bits: 16 pixels × 2 bits = 32, minus 3 anchor bits = 29 bits
 
-          // Extract all 29 index bits
-          uint32_t indexBits = extractBits(block, 99, 29);
+          // Sequential index reader: 29 index bits starting at bit 99,
+          // consumed in pixel order. Anchors store one fewer bit (1 vs 2).
+          uint32_t bitPos = 99;
 
           // For each pixel, determine subset and extract index
           for (int i = 0; i < 16; i++) {
             uint32_t subset = g_bc7_partition3[partition * 16 + i];
             uint32_t epIdx  = subset * 2; // endpoint pair index
 
-            // Determine if this pixel is the anchor for its subset
-            bool isAnchor = false;
-            if (i == 0) isAnchor = true; // subset 0 anchor is always pixel 0
-            else if (subset == 1 && i == g_bc7_anchor3_1[partition]) isAnchor = true;
-            else if (subset == 2 && i == g_bc7_anchor3_2[partition]) isAnchor = true;
-
-            // Anchor pixels have 1 fewer index bit (1 bit), others have 2 bits
-            // For simplicity, we extract 2 bits for all non-anchor pixels
-            // and 1 bit for anchor pixels (with MSB implicitly 0)
-            uint32_t idx;
-            if (isAnchor) {
-              // Anchor: 1 bit (MSB fixed to 0)
-              // We need to compute the bit offset for this pixel
-              // For now, use a simplified approach
-              idx = 0; // Anchor index is always 0 (MSB=0, remaining bits=0)
-            } else {
-              // Non-anchor: 2 bits
-              // Compute bit offset based on pixel position
-              // Simplified: use pixel index to compute offset
-              int bitOffset = i * 2;
-              // Adjust for anchor bits that take 1 fewer bit
-              if (i > 0 && g_bc7_partition3[partition * 16 + 0] == g_bc7_partition3[partition * 16 + i])
-                bitOffset--; // Same subset as pixel 0, anchor saves 1 bit
-              if (i > 0 && i == g_bc7_anchor3_1[partition])
-                bitOffset--; // This is subset 1's anchor
-              if (i > 0 && i == g_bc7_anchor3_2[partition])
-                bitOffset--; // This is subset 2's anchor
-
-              idx = (indexBits >> bitOffset) & 3;
-            }
+            // Anchor: pixel 0, plus table anchors for subsets 1 and 2.
+            // (Pixel 0 is always subset 0 per the partition tables.)
+            bool isAnchor = (i == 0)
+              || (subset == 1 && i == g_bc7_anchor3_1[partition])
+              || (subset == 2 && i == g_bc7_anchor3_2[partition]);
+            uint32_t nbits = isAnchor ? 1u : 2u;
+            uint32_t idx = extractBits(block, bitPos, nbits);
+            bitPos += nbits;
 
             uint32_t w = g_bc7_weights2[idx];
 
@@ -674,49 +653,44 @@ namespace dxvk::util {
 
           uint32_t partition = extractBits(block, 4, 6);
 
-          // Extract 7-bit channel values + P-bit → 8-bit
+          // Extract 7-bit channel values + P-bit → 8-bit.
+          // 7+1 = 8 significant bits already: full = (v << 1) | p,
+          // no replication needed (unlike 6+1/4+1-bit modes).
+          auto expand7P = [](uint32_t v, uint32_t pbit) -> uint8_t {
+            return static_cast<uint8_t>(((v << 1) | (pbit & 1u)) & 0xFFu);
+          };
           uint8_t ep[4][3]; // [endpoint][channel: R=0,G=1,B=2]
 
-          ep[0][0] = (extractBits(block, 10, 7) << 1) | extractBits(block, 94, 1);
-          ep[1][0] = (extractBits(block, 17, 7) << 1) | extractBits(block, 95, 1);
-          ep[2][0] = (extractBits(block, 24, 7) << 1) | extractBits(block, 96, 1);
-          ep[3][0] = (extractBits(block, 31, 7) << 1) | extractBits(block, 97, 1);
+          ep[0][0] = expand7P(extractBits(block, 10, 7), extractBits(block, 94, 1));
+          ep[1][0] = expand7P(extractBits(block, 17, 7), extractBits(block, 95, 1));
+          ep[2][0] = expand7P(extractBits(block, 24, 7), extractBits(block, 96, 1));
+          ep[3][0] = expand7P(extractBits(block, 31, 7), extractBits(block, 97, 1));
 
-          ep[0][1] = (extractBits(block, 38, 7) << 1) | extractBits(block, 94, 1);
-          ep[1][1] = (extractBits(block, 45, 7) << 1) | extractBits(block, 95, 1);
-          ep[2][1] = (extractBits(block, 52, 7) << 1) | extractBits(block, 96, 1);
-          ep[3][1] = (extractBits(block, 59, 7) << 1) | extractBits(block, 97, 1);
+          ep[0][1] = expand7P(extractBits(block, 38, 7), extractBits(block, 94, 1));
+          ep[1][1] = expand7P(extractBits(block, 45, 7), extractBits(block, 95, 1));
+          ep[2][1] = expand7P(extractBits(block, 52, 7), extractBits(block, 96, 1));
+          ep[3][1] = expand7P(extractBits(block, 59, 7), extractBits(block, 97, 1));
 
-          ep[0][2] = (extractBits(block, 66, 7) << 1) | extractBits(block, 94, 1);
-          ep[1][2] = (extractBits(block, 73, 7) << 1) | extractBits(block, 95, 1);
-          ep[2][2] = (extractBits(block, 80, 7) << 1) | extractBits(block, 96, 1);
-          ep[3][2] = (extractBits(block, 87, 7) << 1) | extractBits(block, 97, 1);
+          ep[0][2] = expand7P(extractBits(block, 66, 7), extractBits(block, 94, 1));
+          ep[1][2] = expand7P(extractBits(block, 73, 7), extractBits(block, 95, 1));
+          ep[2][2] = expand7P(extractBits(block, 80, 7), extractBits(block, 96, 1));
+          ep[3][2] = expand7P(extractBits(block, 87, 7), extractBits(block, 97, 1));
 
-          // 30 index bits starting at bit 98
-          uint32_t indexBits = extractBits(block, 98, 30);
+          // Sequential index reader: 30 index bits starting at bit 98,
+          // consumed in pixel order. Anchors store one fewer bit (1 vs 2).
+          uint32_t bitPos = 98;
 
           for (int i = 0; i < 16; i++) {
             uint32_t subset = g_bc7_partition2[partition * 16 + i];
             uint32_t epIdx  = subset * 2;
 
-            // Check if this pixel is the anchor for its subset
-            bool isAnchor = false;
-            if (i == 0) isAnchor = true; // subset 0 anchor is always pixel 0
-            else if (subset == 1 && i == g_bc7_anchor2[partition]) isAnchor = true;
-
-            uint32_t idx;
-            if (isAnchor) {
-              idx = 0; // Anchor: 1 bit, MSB fixed to 0
-            } else {
-              // Non-anchor: 2 bits
-              int bitOffset = i * 2;
-              if (i > 0 && g_bc7_partition2[partition * 16 + 0] == g_bc7_partition2[partition * 16 + i])
-                bitOffset--; // Same subset as pixel 0
-              if (i > 0 && i == g_bc7_anchor2[partition])
-                bitOffset--; // Subset 1's anchor
-
-              idx = (indexBits >> bitOffset) & 3;
-            }
+            // Anchor: pixel 0, plus table anchor for subset 1.
+            // (Pixel 0 is always subset 0 per the partition tables.)
+            bool isAnchor = (i == 0)
+              || (subset == 1 && i == g_bc7_anchor2[partition]);
+            uint32_t nbits = isAnchor ? 1u : 2u;
+            uint32_t idx = extractBits(block, bitPos, nbits);
+            bitPos += nbits;
 
             uint32_t w = g_bc7_weights2[idx];
 
@@ -1006,10 +980,10 @@ namespace dxvk::util {
           uint32_t epb2 = extractBits(block, 96, 1);
           uint32_t epb3 = extractBits(block, 97, 1);
 
-          // Expand 5-bit + P-bit to 8-bit: (5bit << 3 | replicate) then (<<1 | P)
+          // P-bit extends precision: v6 = (v5 << 1) | p, then replicate 6->8.
           auto expand5P = [](uint32_t v5, uint32_t pbit) -> uint8_t {
-            uint8_t v = static_cast<uint8_t>((v5 << 3) | (v5 >> 2));
-            return (v << 1) | static_cast<uint8_t>(pbit);
+            uint32_t v6 = (v5 << 1) | (pbit & 1u);
+            return static_cast<uint8_t>((v6 << 2) | (v6 >> 4));
           };
 
           // 4 endpoints × RGBA channels
@@ -1031,31 +1005,21 @@ namespace dxvk::util {
           ep[2][3] = expand5P(extractBits(block, 84, 5), epb2);
           ep[3][3] = expand5P(extractBits(block, 89, 5), epb3);
 
-          // 30 index bits starting at bit 98
-          uint64_t indexBits = 0;
-          for (int bi = 12; bi < 16; bi++)
-            indexBits |= static_cast<uint64_t>(block[bi]) << (8 * (bi - 12));
-          indexBits >>= 2; // align: bits [98:127] = 30 bits
+          // Sequential index reader: 30 index bits starting at bit 98,
+          // consumed in pixel order. Anchors store one fewer bit (1 vs 2).
+          uint32_t bitPos = 98;
 
           for (int pi = 0; pi < 16; pi++) {
             uint32_t subset = g_bc7_partition2[partition * 16 + pi];
             uint32_t epIdx  = subset * 2;
 
-            bool isAnchor = false;
-            if (pi == 0) isAnchor = true;
-            else if (subset == 1 && pi == g_bc7_anchor2[partition]) isAnchor = true;
-
-            uint32_t idx;
-            if (isAnchor) {
-              idx = 0;
-            } else {
-              int bitOffset = pi * 2;
-              if (pi > 0 && g_bc7_partition2[partition * 16 + 0] == g_bc7_partition2[partition * 16 + pi])
-                bitOffset--;
-              if (pi > 0 && pi == g_bc7_anchor2[partition])
-                bitOffset--;
-              idx = (indexBits >> bitOffset) & 3;
-            }
+            // Anchor: pixel 0, plus table anchor for subset 1.
+            // (Pixel 0 is always subset 0 per the partition tables.)
+            bool isAnchor = (pi == 0)
+              || (subset == 1 && pi == g_bc7_anchor2[partition]);
+            uint32_t nbits = isAnchor ? 1u : 2u;
+            uint32_t idx = extractBits(block, bitPos, nbits);
+            bitPos += nbits;
 
             uint32_t w = g_bc7_weights2[idx];
 
