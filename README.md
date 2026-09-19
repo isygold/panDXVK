@@ -65,7 +65,7 @@ So:
 - Users where it doesn't work = their device truly can't handle BC textures
 
 The fix:
-panDXVK should NOT rely on the wrapper. It should always do the software BC→ASTC transcode when on Mali, regardless of what the wrapper says.
+The transcode gate is kept intentionally — modern wrappers carry the BCN layer, so the pipeline stays dormant behind `!textureCompressionBC` until a wrapper-free device appears. All transcode logging is debug-gated, so release builds pay zero cost.
 
 ## Validation Status
 
@@ -73,6 +73,10 @@ Tested so far — all with wrapper active (`textureCompressionBC = 1`, transcode
 - AIO Graphics Test on Mali-G615 (PanVK 26.2.99 and blob 44.1.0) and Mali-G720 — init parity only.
 - 70 FPS panDXVK vs 51 FPS stock DXVK on AIO spin-cube (non-BC test, Us5rman).
 - Mali-G99 MC3: 700+ FPS AIO with P11, 900+ FPS with P9 (Proton 9 ARM64EC) — suggests strong PanVK + panDXVK throughput headroom.
+
+Current state:
+- Real Mali hardware has no BC support (verified: gpuinfo + leegao unsupported-device list) — the `= 1` in tester logs comes from the wrapper layer.
+- Transcode hot spots optimized: word-level bit extract/insert, verified bit-identical over 12,298 on-device checks.
 
 Still missing — the one test that proves the transcode path:
 1. Select the raw PanVK driver entry (not Wrapper/Apex) in the container graphics settings.
