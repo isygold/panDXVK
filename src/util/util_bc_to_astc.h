@@ -1,6 +1,8 @@
 #pragma once
 
 #include <cstdint>
+#include <cstring>
+#include <algorithm>
 #include <memory>
 #include "../dxvk/dxvk_format.h"
 #include "util_bc_decode.h"
@@ -239,6 +241,109 @@ namespace dxvk::util {
    * \param [out] dstData      Destination ASTC data
    * \param [in]  dstRowPitch  Destination row pitch in bytes
    */
+  /**
+   * \brief Fused per-block BC→ASTC transcode core (no RGBA8 intermediate)
+   *
+   * Decodes one 4x4 BC block to a 64-byte stack buffer, applies the
+   * SNORM→UNORM remap, and encodes straight to ASTC. Eliminates the old
+   * width*height*4 heap intermediate (~33 MB at 4K) and halves memory
+   * traffic vs the decode-full-image / encode-full-image two-pass path.
+   *
+   * Edge handling is bit-identical to the old path: decodeBcImage dropped
+   * out-of-bounds pixels when writing the RGBA image, and
+   * encodeAstcImage4x4 re-gathered with clamp-to-edge. The fused loop
+   * gathers from the decoded block with the same clamp, so the encoder
+   * sees exactly the same 16 pixels per block.
+   *
+   * \param [in] bc             Source BC format
+   * \param [in] remapR         Remap R channel SNORM→UNORM (BC4/BC5 SNORM)
+   * \param [in] remapG         Remap G channel SNORM→UNORM (BC5 SNORM)
+   * \param [in] srcData        Source BC data
+   * \param [in] width          Image width in pixels
+   * \param [in] height         Image height in pixels
+   * \param [in] srcBlockPitch  Source block pitch in bytes (0 = derive)
+   * \param [out] dstData       Destination ASTC data
+   * \param [in] dstRowPitch    Destination row pitch in bytes (0 = derive)
+   */
+  inline void transcodeBcBlocksToAstc(
+          BcFormat       bc,
+          bool           remapR,
+          bool           remapG,
+    const uint8_t*       srcData,
+          uint32_t       width,
+          uint32_t       height,
+          uint32_t       srcBlockPitch,
+          uint8_t*       dstData,
+          VkDeviceSize   dstRowPitch) {
+    const uint32_t blockSizeBytes =
+      (bc == BcFormat::BC1 || bc == BcFormat::BC4) ? 8 : 16;
+
+    const uint32_t blockWidth  = (width + 3) / 4;
+    const uint32_t blockHeight = (height + 3) / 4;
+
+    if (srcBlockPitch == 0)
+      srcBlockPitch = blockWidth * blockSizeBytes;
+    if (dstRowPitch == 0)
+      dstRowPitch = static_cast<VkDeviceSize>(blockWidth) * 16;
+
+    uint8_t decoded[64];    // one 4x4 RGBA8 block from the BC decoder
+    uint8_t encPixels[64];  // clamp-gathered input for the ASTC encoder
+    uint8_t astcBlock[16];
+
+    for (uint32_t by = 0; by < blockHeight; by++) {
+      for (uint32_t bx = 0; bx < blockWidth; bx++) {
+        const uint8_t* srcBlock = srcData
+          + static_cast<VkDeviceSize>(by) * srcBlockPitch
+          + static_cast<VkDeviceSize>(bx) * blockSizeBytes;
+
+        decodeBcBlock(bc, srcBlock, decoded);
+
+        // Gather with clamp-to-edge. Interior blocks (the common case)
+        // encode straight from the decoded pixels; edge blocks replicate
+        // the border pixel exactly like encodeAstcImage4x4's gather.
+        const uint8_t* encSrc = decoded;
+        if (bx * 4 + 4 > width || by * 4 + 4 > height) {
+          for (uint32_t py = 0; py < 4; py++) {
+            const uint32_t cy = std::min(by * 4 + py, height - 1) - by * 4;
+            for (uint32_t px = 0; px < 4; px++) {
+              const uint32_t cx = std::min(bx * 4 + px, width - 1) - bx * 4;
+              const uint32_t s = (cy * 4 + cx) * 4;
+              const uint32_t d = (py * 4 + px) * 4;
+              encPixels[d + 0] = decoded[s + 0];
+              encPixels[d + 1] = decoded[s + 1];
+              encPixels[d + 2] = decoded[s + 2];
+              encPixels[d + 3] = decoded[s + 3];
+            }
+          }
+          encSrc = encPixels;
+        }
+
+        // SNORM→UNORM remap for BC4/BC5 SNORM. BC4_SNORM stores signed
+        // normalized values ([-1,1]) as uint8 bytes in R; BC5_SNORM in
+        // R and G. ASTC is UNORM-only: unorm = (int8_t)snorm + 128.
+        // Per-pixel function, so remap-after-gather == remap-then-gather.
+        if (remapR || remapG) {
+          if (encSrc != encPixels)
+            std::memcpy(encPixels, decoded, sizeof(encPixels));
+          for (uint32_t i = 0; i < 16; i++) {
+            uint8_t* px = encPixels + i * 4;
+            if (remapR)
+              px[0] = static_cast<uint8_t>(static_cast<int8_t>(px[0]) + 128);
+            if (remapG)
+              px[1] = static_cast<uint8_t>(static_cast<int8_t>(px[1]) + 128);
+          }
+          encSrc = encPixels;
+        }
+
+        encodeAstcBlock4x4(encSrc, astcBlock);
+        std::memcpy(
+          dstData + static_cast<VkDeviceSize>(by) * dstRowPitch + bx * 16,
+          astcBlock, sizeof(astcBlock));
+      }
+    }
+  }
+
+
   inline void transcodeBcToAstc(
           DXGI_FORMAT    bcFormat,
     const uint8_t*       srcData,
@@ -247,15 +352,7 @@ namespace dxvk::util {
           VkDeviceSize   srcRowPitch,
           uint8_t*       dstData,
           VkDeviceSize   dstRowPitch) {
-    // Step 1: Decode BC to RGBA8 (intermediate)
-    // Heap allocation — RGBA8 intermediate is width*height*4 bytes,
-    // can be ~33MB for 4K textures. Stack overflow risk if on stack.
     BcFormat bc = dxgiToBcFormat(bcFormat);
-
-    auto rgbaData = std::make_unique<uint8_t[]>(width * height * 4);
-
-    decodeBcImage(bc, srcData, width, height, srcRowPitch,
-                  rgbaData.get(), width * 4);
 
 #ifndef NDEBUG
     // Debug-gated periodic stats dump (every 1000th call).
@@ -267,27 +364,14 @@ namespace dxvk::util {
     }
 #endif
 
-    // Step 1.5: SNORM remap for BC4/BC5
-    // BC4_SNORM/BC5_SNORM store signed normalized values ([-1,1]) as
-    // uint8 bytes: 0=-1.0, 128≈0.0, 255≈-0.008.
-    // ASTC is UNORM-only, so remap: unorm = (int8_t)snorm + 128.
-    if (bcFormat == DXGI_FORMAT_BC4_SNORM || bcFormat == DXGI_FORMAT_BC5_SNORM) {
-      uint32_t numPixels = width * height;
-      for (uint32_t i = 0; i < numPixels; i++) {
-        uint8_t* px = rgbaData.get() + i * 4;
-        // BC4_SNORM: R channel only; BC5_SNORM: R and G channels
-        int8_t s = static_cast<int8_t>(px[0]);
-        px[0] = static_cast<uint8_t>(s + 128);
-        if (bcFormat == DXGI_FORMAT_BC5_SNORM) {
-          s = static_cast<int8_t>(px[1]);
-          px[1] = static_cast<uint8_t>(s + 128);
-        }
-      }
-    }
+    const bool remapR =
+      bcFormat == DXGI_FORMAT_BC4_SNORM || bcFormat == DXGI_FORMAT_BC5_SNORM;
+    const bool remapG = bcFormat == DXGI_FORMAT_BC5_SNORM;
 
-    // Step 2: Encode RGBA8 to ASTC 4x4
-    encodeAstcImage4x4(rgbaData.get(), width, height,
-                       width * 4, dstData, dstRowPitch);
+    transcodeBcBlocksToAstc(bc, remapR, remapG,
+      srcData, width, height,
+      static_cast<uint32_t>(srcRowPitch),
+      dstData, dstRowPitch);
   }
 
 
@@ -354,20 +438,18 @@ namespace dxvk::util {
     VkDeviceSize dstSize = computeAstcImageDataSize(width, height);
     auto dstData = std::make_unique<uint8_t[]>(static_cast<size_t>(dstSize));
 
-    // Decode BC to RGBA8
     BcFormat bc = vkFormatToBcFormat(bcFormat);
-    auto rgbaData = std::make_unique<uint8_t[]>(width * height * 4);
 
-    VkDeviceSize bcBlockPitch = (bc == BcFormat::BC1 || bc == BcFormat::BC4)
-      ? ((static_cast<VkDeviceSize>(width) + 3) / 4) * 8
-      : ((static_cast<VkDeviceSize>(width) + 3) / 4) * 16;
+    // SNORM remap was previously missing on this path — the fused core
+    // applies it, so BC4/BC5 SNORM now behave like the DXGI overload.
+    const bool remapR =
+      bcFormat == VK_FORMAT_BC4_SNORM_BLOCK || bcFormat == VK_FORMAT_BC5_SNORM_BLOCK;
+    const bool remapG = bcFormat == VK_FORMAT_BC5_SNORM_BLOCK;
 
-    decodeBcImage(bc, srcData, width, height, bcBlockPitch,
-                  rgbaData.get(), width * 4);
-
-    // Encode RGBA8 to ASTC 4x4
-    encodeAstcImage4x4(rgbaData.get(), width, height,
-                       width * 4, dstData.get(), width * 4);
+    transcodeBcBlocksToAstc(bc, remapR, remapG,
+      srcData, width, height,
+      static_cast<uint32_t>(srcRowPitch),
+      dstData.get(), width * 4);
 
     return dstData;
   }
