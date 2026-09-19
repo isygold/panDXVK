@@ -67,7 +67,7 @@ So:
 The fix:
 panDXVK should NOT rely on the wrapper. It should always do the software BC→ASTC transcode when on Mali, regardless of what the wrapper says.
 
-## Validation Status (TO-DO 1)
+## Validation Status
 
 Tested so far — all with wrapper active (`textureCompressionBC = 1`, transcode skipped):
 - AIO Graphics Test on Mali-G615 (PanVK 26.2.99 and blob 44.1.0) and Mali-G720 — init parity only.
