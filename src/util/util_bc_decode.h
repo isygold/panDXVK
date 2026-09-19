@@ -273,10 +273,627 @@ namespace dxvk::util {
     return s_stats;
   }
 
+  // ---- BC6H decoding ----
+  // Field layout per Khronos BPTC spec; endpoint math (transform inverse,
+  // unquantize, half-float conversion) validated against the bcdec
+  // reference implementation (MIT, (c) 2022 Sergii Kudlai), which is also
+  // the fuzz oracle. HDR output is clamped to UNORM8 (LDR approximation):
+  // negatives and NaN map to 0, values above 1.0 saturate.
+  struct Bc6hBitstream { uint64_t lo, hi; };
+
+  inline uint32_t bc6hReadBits(Bc6hBitstream& bs, int n) {
+    // Precondition: 1 <= n <= 31 (all BC6H reads are <= 10 bits).
+    uint32_t mask = (n >= 32) ? 0xFFFFFFFFu : ((1u << (unsigned)n) - 1u);
+    uint32_t bits = (uint32_t)(bs.lo & mask);
+    bs.lo >>= n;
+    bs.lo |= (bs.hi & mask) << (64 - n);
+    bs.hi >>= n;
+    return bits;
+  }
+
+  inline uint32_t bc6hReadBitsR(Bc6hBitstream& bs, int n) {
+    // Reversed-bit read (used by single-region high-precision modes).
+    uint32_t bits = bc6hReadBits(bs, n), result = 0;
+    while (n--) {
+      result <<= 1;
+      result |= (bits & 1u);
+      bits >>= 1;
+    }
+    return result;
+  }
+
+  inline int bc6hExtendSign(int val, int bits) {
+    return (val << (32 - bits)) >> (32 - bits);
+  }
+
+  inline int bc6hTransformInverse(int val, int a0, int bits, bool isSigned) {
+    // Delta endpoints wrap around base precision: B += A (mod 2^p).
+    val = (val + a0) & ((1 << bits) - 1);
+    if (isSigned)
+      val = bc6hExtendSign(val, bits);
+    return val;
+  }
+
+  inline int bc6hUnquantize(int val, int bits, bool isSigned) {
+    // Bit-replicate quantized endpoints to full 16-bit range.
+    int unq, s = 0;
+    if (!isSigned) {
+      if (bits >= 15) {
+        unq = val;
+      } else if (!val) {
+        unq = 0;
+      } else if (val == ((1 << bits) - 1)) {
+        unq = 0xFFFF;
+      } else {
+        unq = ((val << 16) + 0x8000) >> bits;
+      }
+    } else {
+      if (bits >= 16) {
+        unq = val;
+      } else {
+        if (val < 0) {
+          s = 1;
+          val = -val;
+        }
+        if (val == 0) {
+          unq = 0;
+        } else if (val >= ((1 << (bits - 1)) - 1)) {
+          unq = 0x7FFF;
+        } else {
+          unq = ((val << 15) + 0x4000) >> (bits - 1);
+        }
+        if (s)
+          unq = -unq;
+      }
+    }
+    return unq;
+  }
+
+  inline float bc6hHalfToFloat(uint16_t half) {
+    // Standard half->float bit manipulation.
+    union { uint32_t u; float f; } o;
+    o.u = (half & 0x7FFFu) << 13;
+    uint32_t exp = (0x7C00u << 13) & o.u;
+    o.u += (127 - 15) << 23;
+    if (exp == (0x7C00u << 13)) {
+      o.u += (128 - 16) << 23;      // Inf/NaN
+    } else if (exp == 0) {
+      static const union { uint32_t u; float f; } magic = { 113u << 23 };
+      o.u += 1u << 23;
+      o.f -= magic.f;               // denormal renormalize
+    }
+    o.u |= (half & 0x8000u) << 16;  // sign
+    return o.f;
+  }
+
+  inline uint8_t bc6hFloatToUnorm8(float f) {
+    if (!(f >= 0.0f))
+      f = 0.0f;   // negatives and NaN saturate to 0
+    if (f > 1.0f)
+      f = 1.0f;   // HDR highlights saturate (LDR approximation)
+    return static_cast<uint8_t>(f * 255.0f + 0.5f);
+  }
+
+  inline uint16_t bc6hFinishHalf(int val, bool isSigned) {
+    // Scale interpolated magnitude to half-float bit pattern.
+    if (!isSigned)
+      return static_cast<uint16_t>((val * 31) >> 6);
+    int v = (val < 0) ? -(((-val) * 31) >> 5) : (val * 31) >> 5;
+    int s = 0;
+    if (v < 0) {
+      s = 0x8000;
+      v = -v;
+    }
+    return static_cast<uint16_t>(s | v);
+  }
+
+  // Base endpoint precision per internal mode 0..13 (W = base, dR/dG/dB = deltas).
+  static constexpr int8_t g_bc6hBaseBits[4][14] = {
+    { 10, 7, 11, 11, 11, 9, 8, 8, 8, 6, 10, 11, 12, 16 },  // W
+    {  5, 6,  5,  4,  4, 5, 6, 5, 5, 6, 10,  9,  8,  4 },  // dR
+    {  5, 6,  4,  5,  4, 5, 5, 6, 5, 6, 10,  9,  8,  4 },  // dG
+    {  5, 6,  4,  4,  5, 5, 5, 5, 6, 6, 10,  9,  8,  4 },  // dB
+  };
+
+  // 32 two-region partitions. Values 0/1 select the subset;
+  // bit 0x80 marks fixup pixels (one fewer index bit).
+  static constexpr uint8_t g_bc6hPartition[32][4][4] = {
+    { {128,0,1,1},   {0,0,1,1},     {0,0,1,1},     {0,0,1,129} },   // 0
+    { {128,0,0,1},   {0,0,0,1},     {0,0,0,1},     {0,0,0,129} },   // 1
+    { {128,1,1,1},   {0,1,1,1},     {0,1,1,1},     {0,1,1,129} },   // 2
+    { {128,0,0,1},   {0,0,1,1},     {0,0,1,1},     {0,1,1,129} },   // 3
+    { {128,0,0,0},   {0,0,0,1},     {0,0,0,1},     {0,0,1,129} },   // 4
+    { {128,0,1,1},   {0,1,1,1},     {0,1,1,1},     {1,1,1,129} },   // 5
+    { {128,0,0,1},   {0,0,1,1},     {0,1,1,1},     {1,1,1,129} },   // 6
+    { {128,0,0,0},   {0,0,0,1},     {0,0,1,1},     {0,1,1,129} },   // 7
+    { {128,0,0,0},   {0,0,0,0},     {0,0,0,1},     {0,0,1,129} },   // 8
+    { {128,0,1,1},   {0,1,1,1},     {1,1,1,1},     {1,1,1,129} },   // 9
+    { {128,0,0,0},   {0,0,0,1},     {0,1,1,1},     {1,1,1,129} },   // 10
+    { {128,0,0,0},   {0,0,0,0},     {0,0,0,1},     {0,1,1,129} },   // 11
+    { {128,0,0,1},   {0,1,1,1},     {1,1,1,1},     {1,1,1,129} },   // 12
+    { {128,0,0,0},   {0,0,0,0},     {1,1,1,1},     {1,1,1,129} },   // 13
+    { {128,0,0,0},   {1,1,1,1},     {1,1,1,1},     {1,1,1,129} },   // 14
+    { {128,0,0,0},   {0,0,0,0},     {0,0,0,0},     {1,1,1,129} },   // 15
+    { {128,0,0,0},   {1,0,0,0},     {1,1,1,0},     {1,1,1,129} },   // 16
+    { {128,1,129,1}, {0,0,0,1},     {0,0,0,0},     {0,0,0,0} },     // 17
+    { {128,0,0,0},   {0,0,0,0},     {129,0,0,0},   {1,1,1,0} },     // 18
+    { {128,1,129,1}, {0,0,1,1},     {0,0,0,1},     {0,0,0,0} },     // 19
+    { {128,0,129,1}, {0,0,0,1},     {0,0,0,0},     {0,0,0,0} },     // 20
+    { {128,0,0,0},   {1,0,0,0},     {129,1,0,0},   {1,1,1,0} },     // 21
+    { {128,0,0,0},   {0,0,0,0},     {129,0,0,0},   {1,1,0,0} },     // 22
+    { {128,1,1,1},   {0,0,1,1},     {0,0,1,1},     {0,0,0,129} },   // 23
+    { {128,0,129,1}, {0,0,0,1},     {0,0,0,1},     {0,0,0,0} },     // 24
+    { {128,0,0,0},   {1,0,0,0},     {129,0,0,0},   {1,1,0,0} },     // 25
+    { {128,1,129,0}, {0,1,1,0},     {0,1,1,0},     {0,1,1,0} },     // 26
+    { {128,0,129,1}, {0,1,1,0},     {0,1,1,0},     {1,1,0,0} },     // 27
+    { {128,0,0,1},   {0,1,1,1},     {129,1,1,0},   {1,0,0,0} },     // 28
+    { {128,0,0,0},   {1,1,1,1},     {129,1,1,1},   {0,0,0,0} },     // 29
+    { {128,1,129,1}, {0,0,0,1},     {1,0,0,0},     {1,1,1,0} },     // 30
+    { {128,0,129,1}, {1,0,0,1},     {1,0,0,1},     {1,1,0,0} },     // 31
+  };
+
+
+  // Full BC6H block decoder.
+  // Field-read order follows the Khronos BPTC bit layout (cross-checked
+  // against the bcdec reference implementation, MIT (c) 2022 Sergii Kudlai;
+  // endpoint math below is our own transcription, fuzz-validated).
+  // HDR output is clamped to UNORM8 (LDR approximation, A forced opaque).
+  inline void decodeBc6hBlock(
+    const uint8_t*       block,
+          uint8_t*       pixels,
+          bool           isSigned) {
+    Bc6hBitstream bs;
+    std::memcpy(&bs.lo, block, 8);
+    std::memcpy(&bs.hi, block + 8, 8);
+
+    int r[4] = {0,0,0,0}, g[4] = {0,0,0,0}, b[4] = {0,0,0,0};
+    int mode = (int)bc6hReadBits(bs, 2);
+    if (mode > 1)
+      mode |= (int)bc6hReadBits(bs, 3) << 2;
+    int partition = 0;
+    bool reserved = false;
+
+    switch (mode) {
+
+        /* mode 1 */
+        case 0b00: {
+            /* Partitition indices: 46 bits
+               Partition: 5 bits
+               Color Endpoints: 75 bits (10.555, 10.555, 10.555) */
+            g[2] |= bc6hReadBits(bs, 1) << 4;       /* gy[4]   */
+            b[2] |= bc6hReadBits(bs, 1) << 4;       /* by[4]   */
+            b[3] |= bc6hReadBits(bs, 1) << 4;       /* bz[4]   */
+            r[0] |= bc6hReadBits(bs, 10);       /* rw[9:0] */
+            g[0] |= bc6hReadBits(bs, 10);       /* gw[9:0] */
+            b[0] |= bc6hReadBits(bs, 10);       /* bw[9:0] */
+            r[1] |= bc6hReadBits(bs, 5);        /* rx[4:0] */
+            g[3] |= bc6hReadBits(bs, 1) << 4;       /* gz[4]   */
+            g[2] |= bc6hReadBits(bs, 4);        /* gy[3:0] */
+            g[1] |= bc6hReadBits(bs, 5);        /* gx[4:0] */
+            b[3] |= bc6hReadBits(bs, 1);            /* bz[0]   */
+            g[3] |= bc6hReadBits(bs, 4);        /* gz[3:0] */
+            b[1] |= bc6hReadBits(bs, 5);        /* bx[4:0] */
+            b[3] |= bc6hReadBits(bs, 1) << 1;       /* bz[1]   */
+            b[2] |= bc6hReadBits(bs, 4);        /* by[3:0] */
+            r[2] |= bc6hReadBits(bs, 5);        /* ry[4:0] */
+            b[3] |= bc6hReadBits(bs, 1) << 2;       /* bz[2]   */
+            r[3] |= bc6hReadBits(bs, 5);        /* rz[4:0] */
+            b[3] |= bc6hReadBits(bs, 1) << 3;       /* bz[3]   */
+            partition = bc6hReadBits(bs, 5);    /* d[4:0]  */
+            mode = 0;
+        } break;
+
+        /* mode 2 */
+        case 0b01: {
+            /* Partitition indices: 46 bits
+               Partition: 5 bits
+               Color Endpoints: 75 bits (7666, 7666, 7666) */
+            g[2] |= bc6hReadBits(bs, 1) << 5;       /* gy[5]   */
+            g[3] |= bc6hReadBits(bs, 1) << 4;       /* gz[4]   */
+            g[3] |= bc6hReadBits(bs, 1) << 5;       /* gz[5]   */
+            r[0] |= bc6hReadBits(bs, 7);        /* rw[6:0] */
+            b[3] |= bc6hReadBits(bs, 1);            /* bz[0]   */
+            b[3] |= bc6hReadBits(bs, 1) << 1;       /* bz[1]   */
+            b[2] |= bc6hReadBits(bs, 1) << 4;       /* by[4]   */
+            g[0] |= bc6hReadBits(bs, 7);        /* gw[6:0] */
+            b[2] |= bc6hReadBits(bs, 1) << 5;       /* by[5]   */
+            b[3] |= bc6hReadBits(bs, 1) << 2;       /* bz[2]   */
+            g[2] |= bc6hReadBits(bs, 1) << 4;       /* gy[4]   */
+            b[0] |= bc6hReadBits(bs, 7);        /* bw[6:0] */
+            b[3] |= bc6hReadBits(bs, 1) << 3;       /* bz[3]   */
+            b[3] |= bc6hReadBits(bs, 1) << 5;       /* bz[5]   */
+            b[3] |= bc6hReadBits(bs, 1) << 4;       /* bz[4]   */
+            r[1] |= bc6hReadBits(bs, 6);        /* rx[5:0] */
+            g[2] |= bc6hReadBits(bs, 4);        /* gy[3:0] */
+            g[1] |= bc6hReadBits(bs, 6);        /* gx[5:0] */
+            g[3] |= bc6hReadBits(bs, 4);        /* gz[3:0] */
+            b[1] |= bc6hReadBits(bs, 6);        /* bx[5:0] */
+            b[2] |= bc6hReadBits(bs, 4);        /* by[3:0] */
+            r[2] |= bc6hReadBits(bs, 6);        /* ry[5:0] */
+            r[3] |= bc6hReadBits(bs, 6);        /* rz[5:0] */
+            partition = bc6hReadBits(bs, 5);    /* d[4:0]  */
+            mode = 1;
+        } break;
+
+        /* mode 3 */
+        case 0b00010: {
+            /* Partitition indices: 46 bits
+               Partition: 5 bits
+               Color Endpoints: 72 bits (11.555, 11.444, 11.444) */
+            r[0] |= bc6hReadBits(bs, 10);       /* rw[9:0] */
+            g[0] |= bc6hReadBits(bs, 10);       /* gw[9:0] */
+            b[0] |= bc6hReadBits(bs, 10);       /* bw[9:0] */
+            r[1] |= bc6hReadBits(bs, 5);        /* rx[4:0] */
+            r[0] |= bc6hReadBits(bs, 1) << 10;      /* rw[10]  */
+            g[2] |= bc6hReadBits(bs, 4);        /* gy[3:0] */
+            g[1] |= bc6hReadBits(bs, 4);        /* gx[3:0] */
+            g[0] |= bc6hReadBits(bs, 1) << 10;      /* gw[10]  */
+            b[3] |= bc6hReadBits(bs, 1);            /* bz[0]   */
+            g[3] |= bc6hReadBits(bs, 4);        /* gz[3:0] */
+            b[1] |= bc6hReadBits(bs, 4);        /* bx[3:0] */
+            b[0] |= bc6hReadBits(bs, 1) << 10;      /* bw[10]  */
+            b[3] |= bc6hReadBits(bs, 1) << 1;       /* bz[1]   */
+            b[2] |= bc6hReadBits(bs, 4);        /* by[3:0] */
+            r[2] |= bc6hReadBits(bs, 5);        /* ry[4:0] */
+            b[3] |= bc6hReadBits(bs, 1) << 2;       /* bz[2]   */
+            r[3] |= bc6hReadBits(bs, 5);        /* rz[4:0] */
+            b[3] |= bc6hReadBits(bs, 1) << 3;       /* bz[3]   */
+            partition = bc6hReadBits(bs, 5);    /* d[4:0]  */
+            mode = 2;
+        } break;
+
+        /* mode 4 */
+        case 0b00110: {
+            /* Partitition indices: 46 bits
+               Partition: 5 bits
+               Color Endpoints: 72 bits (11.444, 11.555, 11.444) */
+            r[0] |= bc6hReadBits(bs, 10);       /* rw[9:0] */
+            g[0] |= bc6hReadBits(bs, 10);       /* gw[9:0] */
+            b[0] |= bc6hReadBits(bs, 10);       /* bw[9:0] */
+            r[1] |= bc6hReadBits(bs, 4);        /* rx[3:0] */
+            r[0] |= bc6hReadBits(bs, 1) << 10;      /* rw[10]  */
+            g[3] |= bc6hReadBits(bs, 1) << 4;       /* gz[4]   */
+            g[2] |= bc6hReadBits(bs, 4);        /* gy[3:0] */
+            g[1] |= bc6hReadBits(bs, 5);        /* gx[4:0] */
+            g[0] |= bc6hReadBits(bs, 1) << 10;      /* gw[10]  */
+            g[3] |= bc6hReadBits(bs, 4);        /* gz[3:0] */
+            b[1] |= bc6hReadBits(bs, 4);        /* bx[3:0] */
+            b[0] |= bc6hReadBits(bs, 1) << 10;      /* bw[10]  */
+            b[3] |= bc6hReadBits(bs, 1) << 1;       /* bz[1]   */
+            b[2] |= bc6hReadBits(bs, 4);        /* by[3:0] */
+            r[2] |= bc6hReadBits(bs, 4);        /* ry[3:0] */
+            b[3] |= bc6hReadBits(bs, 1);            /* bz[0]   */
+            b[3] |= bc6hReadBits(bs, 1) << 2;       /* bz[2]   */
+            r[3] |= bc6hReadBits(bs, 4);        /* rz[3:0] */
+            g[2] |= bc6hReadBits(bs, 1) << 4;       /* gy[4]   */
+            b[3] |= bc6hReadBits(bs, 1) << 3;       /* bz[3]   */
+            partition = bc6hReadBits(bs, 5);    /* d[4:0]  */
+            mode = 3;
+        } break;
+
+        /* mode 5 */
+        case 0b01010: {
+            /* Partitition indices: 46 bits
+               Partition: 5 bits
+               Color Endpoints: 72 bits (11.444, 11.444, 11.555) */
+            r[0] |= bc6hReadBits(bs, 10);       /* rw[9:0] */
+            g[0] |= bc6hReadBits(bs, 10);       /* gw[9:0] */
+            b[0] |= bc6hReadBits(bs, 10);       /* bw[9:0] */
+            r[1] |= bc6hReadBits(bs, 4);        /* rx[3:0] */
+            r[0] |= bc6hReadBits(bs, 1) << 10;      /* rw[10]  */
+            b[2] |= bc6hReadBits(bs, 1) << 4;       /* by[4]   */
+            g[2] |= bc6hReadBits(bs, 4);        /* gy[3:0] */
+            g[1] |= bc6hReadBits(bs, 4);        /* gx[3:0] */
+            g[0] |= bc6hReadBits(bs, 1) << 10;      /* gw[10]  */
+            b[3] |= bc6hReadBits(bs, 1);            /* bz[0]   */
+            g[3] |= bc6hReadBits(bs, 4);        /* gz[3:0] */
+            b[1] |= bc6hReadBits(bs, 5);        /* bx[4:0] */
+            b[0] |= bc6hReadBits(bs, 1) << 10;      /* bw[10]  */
+            b[2] |= bc6hReadBits(bs, 4);        /* by[3:0] */
+            r[2] |= bc6hReadBits(bs, 4);        /* ry[3:0] */
+            b[3] |= bc6hReadBits(bs, 1) << 1;       /* bz[1]   */
+            b[3] |= bc6hReadBits(bs, 1) << 2;       /* bz[2]   */
+            r[3] |= bc6hReadBits(bs, 4);        /* rz[3:0] */
+            b[3] |= bc6hReadBits(bs, 1) << 4;       /* bz[4]   */ 
+            b[3] |= bc6hReadBits(bs, 1) << 3;       /* bz[3]   */
+            partition = bc6hReadBits(bs, 5);    /* d[4:0]  */
+            mode = 4;
+        } break;
+
+        /* mode 6 */
+        case 0b01110: {
+            /* Partitition indices: 46 bits
+               Partition: 5 bits
+               Color Endpoints: 72 bits (9555, 9555, 9555) */
+            r[0] |= bc6hReadBits(bs, 9);        /* rw[8:0] */
+            b[2] |= bc6hReadBits(bs, 1) << 4;       /* by[4]   */
+            g[0] |= bc6hReadBits(bs, 9);        /* gw[8:0] */
+            g[2] |= bc6hReadBits(bs, 1) << 4;       /* gy[4]   */
+            b[0] |= bc6hReadBits(bs, 9);        /* bw[8:0] */
+            b[3] |= bc6hReadBits(bs, 1) << 4;       /* bz[4]   */
+            r[1] |= bc6hReadBits(bs, 5);        /* rx[4:0] */
+            g[3] |= bc6hReadBits(bs, 1) << 4;       /* gz[4]   */
+            g[2] |= bc6hReadBits(bs, 4);        /* gy[3:0] */
+            g[1] |= bc6hReadBits(bs, 5);        /* gx[4:0] */
+            b[3] |= bc6hReadBits(bs, 1);            /* bz[0]   */
+            g[3] |= bc6hReadBits(bs, 4);        /* gx[3:0] */
+            b[1] |= bc6hReadBits(bs, 5);        /* bx[4:0] */
+            b[3] |= bc6hReadBits(bs, 1) << 1;       /* bz[1]   */
+            b[2] |= bc6hReadBits(bs, 4);        /* by[3:0] */
+            r[2] |= bc6hReadBits(bs, 5);        /* ry[4:0] */
+            b[3] |= bc6hReadBits(bs, 1) << 2;       /* bz[2]   */
+            r[3] |= bc6hReadBits(bs, 5);        /* rz[4:0] */
+            b[3] |= bc6hReadBits(bs, 1) << 3;       /* bz[3]   */
+            partition = bc6hReadBits(bs, 5);    /* d[4:0]  */
+            mode = 5;
+        } break;
+
+        /* mode 7 */
+        case 0b10010: {
+            /* Partitition indices: 46 bits
+               Partition: 5 bits
+               Color Endpoints: 72 bits (8666, 8555, 8555) */
+            r[0] |= bc6hReadBits(bs, 8);        /* rw[7:0] */
+            g[3] |= bc6hReadBits(bs, 1) << 4;       /* gz[4]   */
+            b[2] |= bc6hReadBits(bs, 1) << 4;       /* by[4]   */
+            g[0] |= bc6hReadBits(bs, 8);        /* gw[7:0] */
+            b[3] |= bc6hReadBits(bs, 1) << 2;       /* bz[2]   */
+            g[2] |= bc6hReadBits(bs, 1) << 4;       /* gy[4]   */
+            b[0] |= bc6hReadBits(bs, 8);        /* bw[7:0] */
+            b[3] |= bc6hReadBits(bs, 1) << 3;       /* bz[3]   */
+            b[3] |= bc6hReadBits(bs, 1) << 4;       /* bz[4]   */
+            r[1] |= bc6hReadBits(bs, 6);        /* rx[5:0] */
+            g[2] |= bc6hReadBits(bs, 4);        /* gy[3:0] */
+            g[1] |= bc6hReadBits(bs, 5);        /* gx[4:0] */
+            b[3] |= bc6hReadBits(bs, 1);            /* bz[0]   */
+            g[3] |= bc6hReadBits(bs, 4);        /* gz[3:0] */
+            b[1] |= bc6hReadBits(bs, 5);        /* bx[4:0] */
+            b[3] |= bc6hReadBits(bs, 1) << 1;       /* bz[1]   */
+            b[2] |= bc6hReadBits(bs, 4);        /* by[3:0] */
+            r[2] |= bc6hReadBits(bs, 6);        /* ry[5:0] */
+            r[3] |= bc6hReadBits(bs, 6);        /* rz[5:0] */
+            partition = bc6hReadBits(bs, 5);    /* d[4:0]  */
+            mode = 6;
+        } break;
+
+        /* mode 8 */
+        case 0b10110: {
+            /* Partitition indices: 46 bits
+               Partition: 5 bits
+               Color Endpoints: 72 bits (8555, 8666, 8555) */
+            r[0] |= bc6hReadBits(bs, 8);        /* rw[7:0] */
+            b[3] |= bc6hReadBits(bs, 1);            /* bz[0]   */
+            b[2] |= bc6hReadBits(bs, 1) << 4;       /* by[4]   */
+            g[0] |= bc6hReadBits(bs, 8);        /* gw[7:0] */
+            g[2] |= bc6hReadBits(bs, 1) << 5;       /* gy[5]   */
+            g[2] |= bc6hReadBits(bs, 1) << 4;       /* gy[4]   */
+            b[0] |= bc6hReadBits(bs, 8);        /* bw[7:0] */
+            g[3] |= bc6hReadBits(bs, 1) << 5;       /* gz[5]   */
+            b[3] |= bc6hReadBits(bs, 1) << 4;       /* bz[4]   */
+            r[1] |= bc6hReadBits(bs, 5);        /* rx[4:0] */
+            g[3] |= bc6hReadBits(bs, 1) << 4;       /* gz[4]   */
+            g[2] |= bc6hReadBits(bs, 4);        /* gy[3:0] */
+            g[1] |= bc6hReadBits(bs, 6);        /* gx[5:0] */
+            g[3] |= bc6hReadBits(bs, 4);        /* zx[3:0] */
+            b[1] |= bc6hReadBits(bs, 5);        /* bx[4:0] */
+            b[3] |= bc6hReadBits(bs, 1) << 1;       /* bz[1]   */
+            b[2] |= bc6hReadBits(bs, 4);        /* by[3:0] */
+            r[2] |= bc6hReadBits(bs, 5);        /* ry[4:0] */
+            b[3] |= bc6hReadBits(bs, 1) << 2;       /* bz[2]   */
+            r[3] |= bc6hReadBits(bs, 5);        /* rz[4:0] */
+            b[3] |= bc6hReadBits(bs, 1) << 3;       /* bz[3]   */
+            partition = bc6hReadBits(bs, 5);    /* d[4:0]  */
+            mode = 7;
+        } break;
+
+        /* mode 9 */
+        case 0b11010: {
+            /* Partitition indices: 46 bits
+               Partition: 5 bits
+               Color Endpoints: 72 bits (8555, 8555, 8666) */
+            r[0] |= bc6hReadBits(bs, 8);        /* rw[7:0] */
+            b[3] |= bc6hReadBits(bs, 1) << 1;       /* bz[1]   */
+            b[2] |= bc6hReadBits(bs, 1) << 4;       /* by[4]   */
+            g[0] |= bc6hReadBits(bs, 8);        /* gw[7:0] */
+            b[2] |= bc6hReadBits(bs, 1) << 5;       /* by[5]   */
+            g[2] |= bc6hReadBits(bs, 1) << 4;       /* gy[4]   */
+            b[0] |= bc6hReadBits(bs, 8);        /* bw[7:0] */
+            b[3] |= bc6hReadBits(bs, 1) << 5;       /* bz[5]   */
+            b[3] |= bc6hReadBits(bs, 1) << 4;       /* bz[4]   */
+            r[1] |= bc6hReadBits(bs, 5);        /* bw[4:0] */
+            g[3] |= bc6hReadBits(bs, 1) << 4;       /* gz[4]   */
+            g[2] |= bc6hReadBits(bs, 4);        /* gy[3:0] */
+            g[1] |= bc6hReadBits(bs, 5);        /* gx[4:0] */
+            b[3] |= bc6hReadBits(bs, 1);            /* bz[0]   */
+            g[3] |= bc6hReadBits(bs, 4);        /* gz[3:0] */
+            b[1] |= bc6hReadBits(bs, 6);        /* bx[5:0] */
+            b[2] |= bc6hReadBits(bs, 4);        /* by[3:0] */
+            r[2] |= bc6hReadBits(bs, 5);        /* ry[4:0] */
+            b[3] |= bc6hReadBits(bs, 1) << 2;       /* bz[2]   */
+            r[3] |= bc6hReadBits(bs, 5);        /* rz[4:0] */
+            b[3] |= bc6hReadBits(bs, 1) << 3;       /* bz[3]   */
+            partition = bc6hReadBits(bs, 5);    /* d[4:0]  */
+            mode = 8;
+        } break;
+
+        /* mode 10 */
+        case 0b11110: {
+            /* Partitition indices: 46 bits
+               Partition: 5 bits
+               Color Endpoints: 72 bits (6666, 6666, 6666) */
+            r[0] |= bc6hReadBits(bs, 6);        /* rw[5:0] */
+            g[3] |= bc6hReadBits(bs, 1) << 4;       /* gz[4]   */
+            b[3] |= bc6hReadBits(bs, 1);            /* bz[0]   */
+            b[3] |= bc6hReadBits(bs, 1) << 1;       /* bz[1]   */
+            b[2] |= bc6hReadBits(bs, 1) << 4;       /* by[4]   */
+            g[0] |= bc6hReadBits(bs, 6);        /* gw[5:0] */
+            g[2] |= bc6hReadBits(bs, 1) << 5;       /* gy[5]   */
+            b[2] |= bc6hReadBits(bs, 1) << 5;       /* by[5]   */
+            b[3] |= bc6hReadBits(bs, 1) << 2;       /* bz[2]   */
+            g[2] |= bc6hReadBits(bs, 1) << 4;       /* gy[4]   */
+            b[0] |= bc6hReadBits(bs, 6);        /* bw[5:0] */
+            g[3] |= bc6hReadBits(bs, 1) << 5;       /* gz[5]   */
+            b[3] |= bc6hReadBits(bs, 1) << 3;       /* bz[3]   */
+            b[3] |= bc6hReadBits(bs, 1) << 5;       /* bz[5]   */
+            b[3] |= bc6hReadBits(bs, 1) << 4;       /* bz[4]   */
+            r[1] |= bc6hReadBits(bs, 6);        /* rx[5:0] */
+            g[2] |= bc6hReadBits(bs, 4);        /* gy[3:0] */
+            g[1] |= bc6hReadBits(bs, 6);        /* gx[5:0] */
+            g[3] |= bc6hReadBits(bs, 4);        /* gz[3:0] */
+            b[1] |= bc6hReadBits(bs, 6);        /* bx[5:0] */
+            b[2] |= bc6hReadBits(bs, 4);        /* by[3:0] */
+            r[2] |= bc6hReadBits(bs, 6);        /* ry[5:0] */
+            r[3] |= bc6hReadBits(bs, 6);        /* rz[5:0] */
+            partition = bc6hReadBits(bs, 5);    /* d[4:0]  */
+            mode = 9;
+        } break;
+
+        /* mode 11 */
+        case 0b00011: {
+            /* Partitition indices: 63 bits
+               Partition: 0 bits
+               Color Endpoints: 60 bits (10.10, 10.10, 10.10) */
+            r[0] |= bc6hReadBits(bs, 10);       /* rw[9:0] */
+            g[0] |= bc6hReadBits(bs, 10);       /* gw[9:0] */
+            b[0] |= bc6hReadBits(bs, 10);       /* bw[9:0] */
+            r[1] |= bc6hReadBits(bs, 10);       /* rx[9:0] */
+            g[1] |= bc6hReadBits(bs, 10);       /* gx[9:0] */
+            b[1] |= bc6hReadBits(bs, 10);       /* bx[9:0] */
+            mode = 10;
+        } break;
+
+        /* mode 12 */
+        case 0b00111: {
+            /* Partitition indices: 63 bits
+               Partition: 0 bits
+               Color Endpoints: 60 bits (11.9, 11.9, 11.9) */
+            r[0] |= bc6hReadBits(bs, 10);       /* rw[9:0] */
+            g[0] |= bc6hReadBits(bs, 10);       /* gw[9:0] */
+            b[0] |= bc6hReadBits(bs, 10);       /* bw[9:0] */
+            r[1] |= bc6hReadBits(bs, 9);        /* rx[8:0] */
+            r[0] |= bc6hReadBits(bs, 1) << 10;      /* rw[10]  */
+            g[1] |= bc6hReadBits(bs, 9);        /* gx[8:0] */
+            g[0] |= bc6hReadBits(bs, 1) << 10;      /* gw[10]  */
+            b[1] |= bc6hReadBits(bs, 9);        /* bx[8:0] */
+            b[0] |= bc6hReadBits(bs, 1) << 10;      /* bw[10]  */
+            mode = 11;
+        } break;
+
+        /* mode 13 */
+        case 0b01011: {
+            /* Partitition indices: 63 bits
+               Partition: 0 bits
+               Color Endpoints: 60 bits (12.8, 12.8, 12.8) */
+            r[0] |= bc6hReadBits(bs, 10);       /* rw[9:0] */
+            g[0] |= bc6hReadBits(bs, 10);       /* gw[9:0] */
+            b[0] |= bc6hReadBits(bs, 10);       /* bw[9:0] */
+            r[1] |= bc6hReadBits(bs, 8);        /* rx[7:0] */
+            r[0] |= bc6hReadBitsR(bs, 2) << 10;/* rx[10:11] */
+            g[1] |= bc6hReadBits(bs, 8);        /* gx[7:0] */
+            g[0] |= bc6hReadBitsR(bs, 2) << 10;/* gx[10:11] */
+            b[1] |= bc6hReadBits(bs, 8);        /* bx[7:0] */
+            b[0] |= bc6hReadBitsR(bs, 2) << 10;/* bx[10:11] */
+            mode = 12;
+        } break;
+
+        /* mode 14 */
+        case 0b01111: {
+            /* Partitition indices: 63 bits
+               Partition: 0 bits
+               Color Endpoints: 60 bits (16.4, 16.4, 16.4) */
+            r[0] |= bc6hReadBits(bs, 10);       /* rw[9:0] */
+            g[0] |= bc6hReadBits(bs, 10);       /* gw[9:0] */
+            b[0] |= bc6hReadBits(bs, 10);       /* bw[9:0] */
+            r[1] |= bc6hReadBits(bs, 4);        /* rx[3:0] */
+            r[0] |= bc6hReadBitsR(bs, 6) << 10;/* rw[10:15] */
+            g[1] |= bc6hReadBits(bs, 4);        /* gx[3:0] */
+            g[0] |= bc6hReadBitsR(bs, 6) << 10;/* gw[10:15] */
+            b[1] |= bc6hReadBits(bs, 4);        /* bx[3:0] */
+            b[0] |= bc6hReadBitsR(bs, 6) << 10;/* bw[10:15] */
+            mode = 13;
+        } break;
+
+              default: {
+        // Reserved patterns: spec mandates zeroes (alpha stays opaque here).
+        reserved = true;
+      } break;
+    }
+
+    if (reserved) {
+      for (int i = 0; i < 16; i++) {
+        pixels[i * 4 + 0] = 0;
+        pixels[i * 4 + 1] = 0;
+        pixels[i * 4 + 2] = 0;
+        pixels[i * 4 + 3] = 255;
+      }
+      return;
+    }
+
+    int numPartitions = (mode >= 10) ? 0 : 1;
+    int baseBits = (int)g_bc6hBaseBits[0][mode];
+    if (isSigned) {
+      r[0] = bc6hExtendSign(r[0], baseBits);
+      g[0] = bc6hExtendSign(g[0], baseBits);
+      b[0] = bc6hExtendSign(b[0], baseBits);
+    }
+
+    // Delta endpoints are stored relative to base (modes 0-8 only).
+    if ((mode != 9 && mode != 10) || isSigned) {
+      for (int i = 1; i < (numPartitions + 1) * 2; ++i) {
+        r[i] = bc6hExtendSign(r[i], (int)g_bc6hBaseBits[1][mode]);
+        g[i] = bc6hExtendSign(g[i], (int)g_bc6hBaseBits[2][mode]);
+        b[i] = bc6hExtendSign(b[i], (int)g_bc6hBaseBits[3][mode]);
+      }
+    }
+
+    if (mode != 9 && mode != 10) {
+      for (int i = 1; i < (numPartitions + 1) * 2; ++i) {
+        r[i] = bc6hTransformInverse(r[i], r[0], baseBits, isSigned);
+        g[i] = bc6hTransformInverse(g[i], g[0], baseBits, isSigned);
+        b[i] = bc6hTransformInverse(b[i], b[0], baseBits, isSigned);
+      }
+    }
+
+    for (int i = 0; i < (numPartitions + 1) * 2; ++i) {
+      r[i] = bc6hUnquantize(r[i], baseBits, isSigned);
+      g[i] = bc6hUnquantize(g[i], baseBits, isSigned);
+      b[i] = bc6hUnquantize(b[i], baseBits, isSigned);
+    }
+
+    for (int pi = 0; pi < 16; pi++) {
+      int py = pi / 4, px = pi % 4;
+      int subs, nbits;
+      if (mode >= 10) {
+        // Single-region modes: one subset, fixup (short index) on pixel 0.
+        subs = 0;
+        nbits = (pi == 0) ? 3 : 4;
+      } else {
+        int ps = g_bc6hPartition[partition][py][px];
+        nbits = 3;
+        if (ps & 0x80)
+          nbits--;  // fixup pixel: one fewer index bit
+        subs = ps & 0x01;
+      }
+      int idx = (int)bc6hReadBits(bs, nbits);
+      int ep = subs * 2;
+      int w = (mode >= 10)
+        ? (int)bc7Weight4((uint32_t)idx)
+        : (int)g_bc7_weights3[idx];
+      int ri = ((64 - w) * r[ep] + w * r[ep + 1] + 32) >> 6;
+      int gi = ((64 - w) * g[ep] + w * g[ep + 1] + 32) >> 6;
+      int bi = ((64 - w) * b[ep] + w * b[ep + 1] + 32) >> 6;
+      pixels[pi * 4 + 0] = bc6hFloatToUnorm8(bc6hHalfToFloat(bc6hFinishHalf(ri, isSigned)));
+      pixels[pi * 4 + 1] = bc6hFloatToUnorm8(bc6hHalfToFloat(bc6hFinishHalf(gi, isSigned)));
+      pixels[pi * 4 + 2] = bc6hFloatToUnorm8(bc6hHalfToFloat(bc6hFinishHalf(bi, isSigned)));
+      pixels[pi * 4 + 3] = 255;
+    }
+  }
+
   inline void decodeBcBlock(
           BcFormat       bcFormat,
     const uint8_t*       block,
-          uint8_t*       pixels) {
+          uint8_t*       pixels,
+          bool           bc6hSigned = false) {
     // Helper: double 6-bit color to 8-bit
     auto expand6 = [](uint32_t v) -> uint8_t {
       return static_cast<uint8_t>((v << 2) | (v >> 4));
@@ -441,53 +1058,9 @@ namespace dxvk::util {
       }
 
       case BcFormat::BC6H: {
-        // BC6H: 16 bytes per block, half-float RGB
-        // Simplified decode: extract endpoints and interpolate
-        // This is a minimal implementation — full BC6H is very complex
-        uint16_t halfRed[16], halfGreen[16], halfBlue[16];
-
-        // For now, decode to a simple approximation
-        // A proper BC6H decoder would need hundreds of lines
-        // We'll output linear interpolation between endpoints
-        uint64_t lo = 0, hi = 0;
-        for (int i = 0; i < 8; i++) {
-          lo |= static_cast<uint64_t>(block[i])     << (8 * i);
-          hi |= static_cast<uint64_t>(block[8 + i]) << (8 * i);
-        }
-
-        // Extract 10-bit endpoints (simplified)
-        uint32_t ep0_r = lo        & 0x3FF;
-        uint32_t ep0_g = (lo >> 10) & 0x3FF;
-        uint32_t ep0_b = (lo >> 20) & 0x3FF;
-        uint32_t ep1_r = (lo >> 30) & 0x3FF;
-        uint32_t ep1_g = (lo >> 40) & 0x3FF;
-        uint32_t ep1_b = (lo >> 50) & 0x3FF;
-
-        // Convert 10-bit to float, then to 8-bit for output
-        auto toFloat8 = [](uint32_t v10) -> uint8_t {
-          // Simple linear mapping [0,1023] -> [0,255]
-          return static_cast<uint8_t>((v10 * 255) / 1023);
-        };
-
-        // Use color indices from remaining bits
-        uint64_t indices = hi >> 16;
-        for (int i = 0; i < 16; i++) {
-          uint32_t idx = (indices >> (2 * i)) & 3;
-          uint32_t t = idx;
-          uint8_t r = static_cast<uint8_t>(
-            ((4 - t) * toFloat8(ep0_r) + t * toFloat8(ep1_r)) / 4);
-          uint8_t g = static_cast<uint8_t>(
-            ((4 - t) * toFloat8(ep0_g) + t * toFloat8(ep1_g)) / 4);
-          uint8_t b = static_cast<uint8_t>(
-            ((4 - t) * toFloat8(ep0_b) + t * toFloat8(ep1_b)) / 4);
-          halfRed[i]   = r;
-          halfGreen[i] = g;
-          halfBlue[i]  = b;
-          pixels[i * 4 + 0] = r;
-          pixels[i * 4 + 1] = g;
-          pixels[i * 4 + 2] = b;
-          pixels[i * 4 + 3] = 255;
-        }
+        // BC6H: 16 bytes per block, HDR RGB (UF16/SF16 half-float).
+        // Full 14-mode decoder (see decodeBc6hBlock); HDR clamped to LDR.
+        decodeBc6hBlock(block, pixels, bc6hSigned);
         break;
       }
 
@@ -1102,7 +1675,8 @@ namespace dxvk::util {
           uint32_t       height,
           VkDeviceSize   srcRowPitch,
           uint8_t*       dstData,
-          VkDeviceSize   dstRowPitch) {
+          VkDeviceSize   dstRowPitch,
+          bool           bc6hSigned = false) {
     uint32_t blockWidth  = (width + 3) / 4;
     uint32_t blockHeight = (height + 3) / 4;
 
@@ -1126,7 +1700,7 @@ namespace dxvk::util {
       for (uint32_t bx = 0; bx < blockWidth; bx++) {
         const uint8_t* block = srcData + static_cast<VkDeviceSize>(by) * srcBlockPitch + bx * blockSizeBytes;
 
-        decodeBcBlock(bcFormat, block, blockPixels);
+        decodeBcBlock(bcFormat, block, blockPixels, bc6hSigned);
 
         // Copy decoded pixels to destination, clamping to image bounds
         for (uint32_t py = 0; py < 4; py++) {
