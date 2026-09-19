@@ -89,5 +89,5 @@ Without this, no log currently proves BC→ASTC works on real hardware.
 ## Upstream Reference
 - Upstream DXVK: [doitsujin/dxvk](https://github.com/doitsujin/dxvk)
 - DXVK Sarek: [pythonlover02/dxvk-sarek](https://github.com/pythonlover02/dxvk-sarek)
-- Forked from: [v1.10.3](https://github.com/doitsujin/dxvk/tree/v1.10.3)
+- Forked from: [pythonlover02/dxvk-sarek@v1.10.3](https://github.com/pythonlover02/dxvk-sarek/tree/v1.10.3)
 - Upstream latest: [v3.1](https://github.com/doitsujin/dxvk/releases/tag/v3.1)
