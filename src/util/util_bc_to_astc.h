@@ -104,10 +104,13 @@ namespace dxvk::util {
       case VK_FORMAT_BC5_SNORM_BLOCK:
         return VK_FORMAT_ASTC_4x4_UNORM_BLOCK;
 
-      // BC6H → ASTC 6x6 LDR (approximation)
+      // BC6H (HDR float RGB) → ASTC 4x4 LDR (approximation).
+      // Must match the 4x4 encoder: a 6x6 mapping would misinterpret
+      // the transcoded blocks (different texel footprint/count).
+      // HDR range is clamped (see decodeBc6hBlock).
       case VK_FORMAT_BC6H_UFLOAT_BLOCK:
       case VK_FORMAT_BC6H_SFLOAT_BLOCK:
-        return VK_FORMAT_ASTC_6x6_UNORM_BLOCK;
+        return VK_FORMAT_ASTC_4x4_UNORM_BLOCK;
 
       // BC7 → ASTC 4x4
       case VK_FORMAT_BC7_UNORM_BLOCK:
@@ -164,12 +167,13 @@ namespace dxvk::util {
       case DXGI_FORMAT_BC5_SNORM:
         return VK_FORMAT_ASTC_4x4_UNORM_BLOCK;
 
-      // BC6H (1 B/px, RGB float) → ASTC 6x6 LDR (approximation)
+      // BC6H (1 B/px, RGB float) → ASTC 4x4 LDR (approximation).
+      // Must match the 4x4 encoder (see VkFormat overload note above).
       case DXGI_FORMAT_BC6H_TYPELESS:
       case DXGI_FORMAT_BC6H_UF16:
-        return VK_FORMAT_ASTC_6x6_UNORM_BLOCK;
+        return VK_FORMAT_ASTC_4x4_UNORM_BLOCK;
       case DXGI_FORMAT_BC6H_SF16:
-        return VK_FORMAT_ASTC_6x6_UNORM_BLOCK;
+        return VK_FORMAT_ASTC_4x4_UNORM_BLOCK;
 
       // BC7 (1 B/px, RGBA) → ASTC 4x4
       case DXGI_FORMAT_BC7_TYPELESS:
@@ -258,6 +262,7 @@ namespace dxvk::util {
    * \param [in] bc             Source BC format
    * \param [in] remapR         Remap R channel SNORM→UNORM (BC4/BC5 SNORM)
    * \param [in] remapG         Remap G channel SNORM→UNORM (BC5 SNORM)
+   * \param [in] bc6hSigned     BC6H SFLOAT (signed) vs UFLOAT decode
    * \param [in] srcData        Source BC data
    * \param [in] width          Image width in pixels
    * \param [in] height         Image height in pixels
@@ -269,6 +274,7 @@ namespace dxvk::util {
           BcFormat       bc,
           bool           remapR,
           bool           remapG,
+          bool           bc6hSigned,
     const uint8_t*       srcData,
           uint32_t       width,
           uint32_t       height,
@@ -296,7 +302,7 @@ namespace dxvk::util {
           + static_cast<VkDeviceSize>(by) * srcBlockPitch
           + static_cast<VkDeviceSize>(bx) * blockSizeBytes;
 
-        decodeBcBlock(bc, srcBlock, decoded);
+        decodeBcBlock(bc, srcBlock, decoded, bc6hSigned);
 
         // Gather with clamp-to-edge. Interior blocks (the common case)
         // encode straight from the decoded pixels; edge blocks replicate
@@ -367,8 +373,9 @@ namespace dxvk::util {
     const bool remapR =
       bcFormat == DXGI_FORMAT_BC4_SNORM || bcFormat == DXGI_FORMAT_BC5_SNORM;
     const bool remapG = bcFormat == DXGI_FORMAT_BC5_SNORM;
+    const bool bc6hSigned = bcFormat == DXGI_FORMAT_BC6H_SF16;
 
-    transcodeBcBlocksToAstc(bc, remapR, remapG,
+    transcodeBcBlocksToAstc(bc, remapR, remapG, bc6hSigned,
       srcData, width, height,
       static_cast<uint32_t>(srcRowPitch),
       dstData, dstRowPitch);
@@ -445,8 +452,9 @@ namespace dxvk::util {
     const bool remapR =
       bcFormat == VK_FORMAT_BC4_SNORM_BLOCK || bcFormat == VK_FORMAT_BC5_SNORM_BLOCK;
     const bool remapG = bcFormat == VK_FORMAT_BC5_SNORM_BLOCK;
+    const bool bc6hSigned = bcFormat == VK_FORMAT_BC6H_SFLOAT_BLOCK;
 
-    transcodeBcBlocksToAstc(bc, remapR, remapG,
+    transcodeBcBlocksToAstc(bc, remapR, remapG, bc6hSigned,
       srcData, width, height,
       static_cast<uint32_t>(srcRowPitch),
       dstData.get(), width * 4);
