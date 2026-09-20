@@ -9,7 +9,7 @@ Based on [DXVK v1.10.3](https://github.com/doitsujin/dxvk/tree/v1.10.3), forked 
 - **Automatic Detection**: Transcode activates only when `DxvkAdapter::isPanVk()` (vendor ID `0x13B5`) AND `textureCompressionBC = false`. Devices with blob driver BC support are left alone.
 - **Format Remap**: VkImage, SRV, and RTV formats are remapped from BC to ASTC transparently. No game-side changes required.
 - **Heap-Allocated Buffers**: RGBA8 intermediate and ASTC output are heap-allocated to avoid stack overflow on DXVK's small thread stacks.
-- **Transcode Timing**: Debug-gated logging reports per-subresource transcode time for profiling (debug builds only — zero cost in release).
+- **Transcode Timing**: Debug-level logging reports per-subresource transcode time for profiling (visible with `DXVK_LOG_LEVEL=debug`; stays on in current builds — see note below).
 - **x64 + x32**: Both 64-bit and 32-bit DLLs built and verified.
 
 ## Installation (Winlator / Bannerlator)
@@ -66,7 +66,7 @@ So:
 - Users where it doesn't work = their device truly can't handle BC textures
 
 The fix:
-The transcode gate is kept intentionally — modern wrappers carry the BCN layer, so the pipeline stays dormant behind `!textureCompressionBC` until a wrapper-free device appears. All transcode logging is debug-gated, so release builds pay zero cost.
+The transcode gate is kept intentionally — modern wrappers carry the BCN layer, so the pipeline stays dormant behind `!textureCompressionBC` until a wrapper-free device appears. All transcode logging is debug-level; note our CI does not define `NDEBUG` (Meson `b_ndebug` defaults off and is never set), so this logging ships live in current builds — useful while testing, to be compiled out (`-Db_ndebug=true`) when stabilizing.
 
 ## Validation Status
 
