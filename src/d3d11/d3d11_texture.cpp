@@ -41,6 +41,10 @@ namespace dxvk {
         formatInfo.Format = astcFormat;
         formatFamily.FormatCount = 1;
         formatFamily.Formats[0] = astcFormat;
+        // Record the real layout format so pitch/offset math below uses
+        // ASTC block sizes, not the stale BC ones. m_packedFormat stays BC
+        // so UpdateTexture keeps triggering the transcode.
+        m_transcodedFormat = astcFormat;
       }
     }
 
@@ -252,7 +256,7 @@ namespace dxvk {
   
   
   VkDeviceSize D3D11CommonTexture::ComputeMappedOffset(UINT Subresource, UINT Plane, VkOffset3D Offset) const {
-    auto packedFormatInfo = imageFormatInfo(m_packedFormat);
+    auto packedFormatInfo = imageFormatInfo(GetDataFormat());
 
     VkImageAspectFlags aspectMask = packedFormatInfo->aspectMask;
     VkDeviceSize elementSize = packedFormatInfo->elementSize;
@@ -304,7 +308,7 @@ namespace dxvk {
       case D3D11_COMMON_TEXTURE_MAP_MODE_NONE:
       case D3D11_COMMON_TEXTURE_MAP_MODE_BUFFER:
       case D3D11_COMMON_TEXTURE_MAP_MODE_STAGING: {
-        auto packedFormatInfo = imageFormatInfo(m_packedFormat);
+        auto packedFormatInfo = imageFormatInfo(GetDataFormat());
 
         VkImageAspectFlags aspects = packedFormatInfo->aspectMask;
         VkExtent3D mipExtent = MipLevelExtent(subresource.mipLevel);
