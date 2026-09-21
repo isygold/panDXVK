@@ -561,10 +561,15 @@ namespace dxvk {
     const UINT                              Values[4]) {
     D3D10DeviceLock lock = LockContext();
 
-    auto uav = static_cast<D3D11UnorderedAccessView*>(pUnorderedAccessView);
-    
-    if (!uav)
+    if (!pUnorderedAccessView)
       return;
+
+    Com<ID3D11UnorderedAccessView> qiUav;
+    
+    if (FAILED(pUnorderedAccessView->QueryInterface(IID_PPV_ARGS(&qiUav))))
+      return;
+
+    auto uav = static_cast<D3D11UnorderedAccessView*>(qiUav.ptr());
     
     // Gather UAV format info. We'll use this to determine
     // whether we need to create a temporary view or not.
@@ -3921,12 +3926,12 @@ namespace dxvk {
     for (uint32_t i = 0; i < NumBuffers; i++) {
       auto newBuffer = static_cast<D3D11Buffer*>(ppConstantBuffers[i]);
       
-      UINT constantCount = 0;
-      
-      if (likely(newBuffer != nullptr))
-        constantCount = std::min(newBuffer->Desc()->ByteWidth / 16, UINT(D3D11_REQ_CONSTANT_BUFFER_ELEMENT_COUNT));
+      uint32_t constantCount = newBuffer
+        ? std::min(newBuffer->Desc()->ByteWidth / 16, UINT(D3D11_REQ_CONSTANT_BUFFER_ELEMENT_COUNT))
+        : 0u;
       
       if (Bindings[StartSlot + i].buffer         != newBuffer
+       || Bindings[StartSlot + i].constantOffset != 0
        || Bindings[StartSlot + i].constantCount  != constantCount) {
         Bindings[StartSlot + i].buffer         = newBuffer;
         Bindings[StartSlot + i].constantOffset = 0;
