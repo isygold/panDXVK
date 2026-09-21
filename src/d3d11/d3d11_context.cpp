@@ -3839,7 +3839,9 @@ namespace dxvk {
       // format metadata, so deal with it manually here.
       VkExtent3D dstMipExtent = pDstTexture->MipLevelExtent(pDstSubresource->mipLevel);
 
-      auto dstFormat = pDstTexture->GetPackedFormat();
+      // panDXVK: use the real (possibly transcoded) layout format so
+      // staging size math matches the data UpdateTexture packed above.
+      auto dstFormat = pDstTexture->GetDataFormat();
       auto dstFormatInfo = imageFormatInfo(dstFormat);
 
       uint32_t planeCount = 1;
