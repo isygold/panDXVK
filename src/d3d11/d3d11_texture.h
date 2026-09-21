@@ -241,6 +241,22 @@ namespace dxvk {
     VkFormat GetPackedFormat() const {
       return m_packedFormat;
     }
+
+    /**
+     * \brief Returns the format describing the actual image/memory layout
+     *
+     * panDXVK: for BC→ASTC remapped textures this is the ASTC format,
+     * otherwise identical to GetPackedFormat(). All block-size and pitch
+     * math MUST use this (never the packed BC format) so Map/staging
+     * computations match the real allocation. GetPackedFormat() stays BC
+     * so UpdateTexture keeps triggering the transcode.
+     * \returns Data-layout Vulkan format
+     */
+    VkFormat GetDataFormat() const {
+      return m_transcodedFormat != VK_FORMAT_UNDEFINED
+        ? m_transcodedFormat
+        : m_packedFormat;
+    }
     
     /**
      * \brief Checks whether the resource is eligible for tracking
@@ -391,6 +407,9 @@ namespace dxvk {
     D3D11_COMMON_TEXTURE_MAP_MODE m_mapMode;
     DXGI_USAGE                    m_dxgiUsage;
     VkFormat                      m_packedFormat;
+    // panDXVK: ASTC format for BC→ASTC remapped textures (UNDEFINED
+    // otherwise). Drives all layout/pitch math via GetDataFormat().
+    VkFormat                      m_transcodedFormat = VK_FORMAT_UNDEFINED;
     
     Rc<DxvkImage>                 m_image;
     std::vector<MappedBuffer>     m_buffers;
