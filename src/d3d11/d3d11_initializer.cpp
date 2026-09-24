@@ -1,7 +1,9 @@
 #include <cstring>
+#include <memory>
 
 #include "d3d11_device.h"
 #include "d3d11_initializer.h"
+#include "../util/util_bc_to_astc.h"
 
 namespace dxvk {
 
@@ -125,6 +127,12 @@ namespace dxvk {
     VkFormat packedFormat = m_parent->LookupPackedFormat(desc->Format, pTexture->GetFormatMode()).Format;
     auto formatInfo = imageFormatInfo(packedFormat);
 
+    // panDXVK: layout math + packing must use the REAL (possibly remapped)
+    // data format. m_packedFormat stays BC so UpdateTexture keeps firing.
+    VkFormat dataFormat = pTexture->GetDataFormat();
+    auto dataFormatInfo = imageFormatInfo(dataFormat);
+    const bool remapped = (dataFormat != packedFormat);
+
     if (pInitialData != nullptr && pInitialData->pSysMem != nullptr) {
       // pInitialData is an array that stores an entry for
       // every single subresource. Since we will define all
@@ -137,21 +145,41 @@ namespace dxvk {
           VkOffset3D mipLevelOffset = { 0, 0, 0 };
           VkExtent3D mipLevelExtent = pTexture->MipLevelExtent(level);
 
+          // panDXVK: remapped textures hold ASTC, but initial data is BC.
+          // Transcode first so every upload path below sees ASTC data with
+          // ASTC pitch. (UpdateTexture hooks only cover later uploads.)
+          std::unique_ptr<uint8_t[]> transcoded;
+          const void* uploadData = pInitialData[id].pSysMem;
+          VkDeviceSize uploadPitch = pInitialData[id].SysMemPitch;
+          if (remapped) {
+            VkDeviceSize astcSize = util::computeAstcImageDataSize(
+              mipLevelExtent.width, mipLevelExtent.height);
+            transcoded = std::make_unique<uint8_t[]>(
+              static_cast<size_t>(astcSize));
+            util::transcodeBcToAstc(desc->Format,
+              static_cast<const uint8_t*>(pInitialData[id].pSysMem),
+              mipLevelExtent.width, mipLevelExtent.height,
+              pInitialData[id].SysMemPitch,
+              transcoded.get(), 0);
+            uploadData = transcoded.get();
+            uploadPitch = ((static_cast<VkDeviceSize>(mipLevelExtent.width) + 3) / 4) * 16;
+          }
+
           if (mapMode != D3D11_COMMON_TEXTURE_MAP_MODE_STAGING) {
             m_transferCommands += 1;
             m_transferMemory   += pTexture->GetSubresourceLayout(formatInfo->aspectMask, id).Size;
-            
+
             VkImageSubresourceLayers subresourceLayers;
             subresourceLayers.aspectMask     = formatInfo->aspectMask;
             subresourceLayers.mipLevel       = level;
             subresourceLayers.baseArrayLayer = layer;
             subresourceLayers.layerCount     = 1;
-            
+
             if (formatInfo->aspectMask != (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) {
               m_context->uploadImage(
                 image, subresourceLayers,
-                pInitialData[id].pSysMem,
-                pInitialData[id].SysMemPitch,
+                uploadData,
+                uploadPitch,
                 pInitialData[id].SysMemSlicePitch);
             } else {
               m_context->updateDepthStencilImage(
@@ -167,8 +195,8 @@ namespace dxvk {
 
           if (mapMode != D3D11_COMMON_TEXTURE_MAP_MODE_NONE) {
             util::packImageData(pTexture->GetMappedBuffer(id)->mapPtr(0),
-              pInitialData[id].pSysMem, pInitialData[id].SysMemPitch, pInitialData[id].SysMemSlicePitch,
-              0, 0, pTexture->GetVkImageType(), mipLevelExtent, 1, formatInfo, formatInfo->aspectMask);
+              uploadData, uploadPitch, pInitialData[id].SysMemSlicePitch,
+              0, 0, pTexture->GetVkImageType(), mipLevelExtent, 1, dataFormatInfo, dataFormatInfo->aspectMask);
           }
         }
       }
