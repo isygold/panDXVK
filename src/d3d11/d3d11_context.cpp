@@ -3443,6 +3443,25 @@ namespace dxvk {
     bool dstIsImage = pDstTexture->GetMapMode() != D3D11_COMMON_TEXTURE_MAP_MODE_STAGING;
     bool srcIsImage = pSrcTexture->GetMapMode() != D3D11_COMMON_TEXTURE_MAP_MODE_STAGING;
 
+    // panDXVK v5: does each side's *image* hold ASTC instead of BC?
+    // Staging resources never count (they have no image), which is exactly
+    // what makes the staging→image case a transcode seam and the
+    // image→staging case an unsupported readback.
+    bool dstImageAstc = dstIsImage
+      && pDstTexture->GetDataFormat() != pDstTexture->GetPackedFormat();
+    bool srcImageAstc = srcIsImage
+      && pSrcTexture->GetDataFormat() != pSrcTexture->GetPackedFormat();
+
+    // Image→image with mismatched storage would reinterpret raw bytes.
+    // The remap gate is process-wide, so this can only happen for a BC
+    // sub-format we have no ASTC mapping for — reject rather than corrupt.
+    if (dstIsImage && srcIsImage && dstImageAstc != srcImageAstc) {
+      Logger::err(str::format(
+        "panDXVK: CopyImage: BC/ASTC image mismatch, dst ASTC=",
+        dstImageAstc, " src ASTC=", srcImageAstc, " — skipped"));
+      return;
+    }
+
     if (dstIsImage && srcIsImage) {
       EmitCs([
         cDstImage  = pDstTexture->GetImage(),
@@ -3504,14 +3523,64 @@ namespace dxvk {
             VkImageSubresourceLayers dstLayer = { dstAspectMask,
               pDstLayers->mipLevel, pDstLayers->baseArrayLayer + i, 1 };
 
+            // panDXVK v5 — staging→image CPU ingress seam.
+            //
+            // The staging source holds app-visible BC bytes while the
+            // destination image is ASTC. Transcode the source box here, at
+            // the CPU→image boundary, and feed copyBufferToImage a tightly
+            // packed ASTC buffer (row/slice alignment 0 = tight), the same
+            // contract UpdateImage's image path already uses.
+            Rc<DxvkBuffer>       transcodeBuffer;
+            D3D11_COMMON_TEXTURE_SUBRESOURCE_LAYOUT transcodeLayout = { };
+            VkDeviceSize         transcodeOffset = 0;
+
+            if (dstImageAstc) {
+              if (!util::isBcFormat(pSrcTexture->GetPackedFormat())
+               || dstExtent != SrcExtent) {
+                Logger::err(str::format(
+                  "panDXVK: CopyImage: cannot upload DXGI_FORMAT=",
+                  pSrcTexture->GetPackedFormat(),
+                  " into ASTC image (extent mismatch or non-BC source), skipped"));
+                return;
+              }
+
+              auto srcLayout = pSrcTexture->GetSubresourceLayout(srcAspectMask, srcSubresource);
+
+              DxvkBufferSlice srcSlice(pSrcTexture->GetMappedBuffer(srcSubresource));
+              auto* srcPtr = static_cast<const uint8_t*>(srcSlice.mapPtr(0))
+                           + pSrcTexture->ComputeMappedOffset(srcSubresource, j, SrcOffset);
+
+              VkDeviceSize astcSlicePitch = util::computeAstcImageDataSize(
+                SrcExtent.width, SrcExtent.height);
+
+              DxvkBufferSlice dstSlice = AllocStagingBuffer(
+                astcSlicePitch * VkDeviceSize(SrcExtent.depth));
+              auto* dstPtr = static_cast<uint8_t*>(dstSlice.mapPtr(0));
+
+              // Transcode is 2D-only: one pass per depth slice.
+              for (uint32_t z = 0; z < SrcExtent.depth; z++) {
+                util::transcodeBcToAstc(pSrcTexture->Desc()->Format,
+                  srcPtr + VkDeviceSize(z) * srcLayout.DepthPitch,
+                  SrcExtent.width, SrcExtent.height, srcLayout.RowPitch,
+                  dstPtr + VkDeviceSize(z) * astcSlicePitch,
+                  0 /* dstRowPitch 0 → core derives tight ASTC row pitch */);
+              }
+
+              transcodeBuffer = dstSlice.buffer();
+              transcodeOffset = dstSlice.offset();
+            }
+
             EmitCs([
               cDstImage   = pDstTexture->GetImage(),
               cDstLayers  = dstLayer,
               cDstOffset  = DstOffset,
               cDstExtent  = dstExtent,
-              cSrcBuffer  = pSrcTexture->GetMappedBuffer(srcSubresource),
-              cSrcLayout  = pSrcTexture->GetSubresourceLayout(srcAspectMask, srcSubresource),
-              cSrcOffset  = pSrcTexture->ComputeMappedOffset(srcSubresource, j, SrcOffset),
+              cSrcBuffer  = transcodeBuffer != nullptr ? transcodeBuffer
+                : pSrcTexture->GetMappedBuffer(srcSubresource),
+              cSrcLayout  = transcodeBuffer != nullptr ? transcodeLayout
+                : pSrcTexture->GetSubresourceLayout(srcAspectMask, srcSubresource),
+              cSrcOffset  = transcodeBuffer != nullptr ? transcodeOffset
+                : pSrcTexture->ComputeMappedOffset(srcSubresource, j, SrcOffset),
               cSrcCoord   = SrcOffset,
               cSrcExtent  = srcMipExtent,
               cSrcFormat  = pSrcTexture->GetPackedFormat()
@@ -3530,6 +3599,20 @@ namespace dxvk {
               }
             });
           } else if (srcIsImage) {
+            // panDXVK v5 — image→staging readback guard.
+            // Reading an ASTC image back into a BC-sized buffer would run
+            // copyImageToBuffer past the end of the destination. We have no
+            // ASTC decoder, so this remains a documented limitation.
+            if (srcImageAstc) {
+              static bool reported = false;
+              if (!reported) {
+                reported = true;
+                Logger::err("panDXVK: CopyImage: readback from a transcoded "
+                  "BC→ASTC texture is not supported; skipping image→staging copy");
+              }
+              continue;
+            }
+
             VkImageSubresourceLayers srcLayer = { srcAspectMask,
               pSrcLayers->mipLevel, pSrcLayers->baseArrayLayer + i, 1 };
 
@@ -3729,12 +3812,14 @@ namespace dxvk {
     // panDXVK: Transcode BC→ASTC if destination is ASTC (PanVK detected)
     // Use heap allocation — ASTC output can be ~8MB for 4K textures,
     // and DXVK thread stacks may be as small as 1MB.
+    //
+    // v5 gate: the destination texture's image being ASTC is exactly
+    // (GetDataFormat() != GetPackedFormat()). Staging destinations never
+    // set m_transcodedFormat, so they stay on the plain BC path — which is
+    // correct, because staging has no image to upload to.
     std::unique_ptr<uint8_t[]> astcData;
 
-    if (util::isBcFormat(packedFormat)
-        && m_device->adapter()->isPanVk()
-        && (util::forceTranscodeEnabled()
-            || !m_device->features().core.features.textureCompressionBC)) {
+    if (pDstTexture->GetDataFormat() != packedFormat) {
       // Use the actual update extent (pDstBox subregion or full mip level)
 #ifndef NDEBUG
       auto t0 = std::chrono::high_resolution_clock::now();
@@ -3780,7 +3865,9 @@ namespace dxvk {
 
       // Override src data + format for the staging buffer path below.
       pSrcData = astcData.get();
-      SrcRowPitch = extent.width * 4;
+      // ASTC 4x4 block row pitch, not width*4 — these differ whenever the
+      // width is not a multiple of 4.
+      SrcRowPitch = static_cast<UINT>(((extent.width + 3) / 4) * 16);
       packedFormat = util::bcToAstcFormat(packedFormat);
       formatInfo = imageFormatInfo(packedFormat);
     }

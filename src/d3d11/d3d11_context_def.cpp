@@ -1,6 +1,8 @@
 #include "d3d11_context_def.h"
 #include "d3d11_device.h"
 
+#include "../util/util_bc_to_astc.h"
+
 namespace dxvk {
   
   D3D11DeferredContext::D3D11DeferredContext(
@@ -162,6 +164,10 @@ namespace dxvk {
           ID3D11CommandList   **ppCommandList) {
     D3D10DeviceLock lock = LockContext();
 
+    // panDXVK v5: commit any BC→ASTC image uploads the application left
+    // mapped. Must happen before the chunk is finalized below.
+    CommitAllPendingImageUploads();
+
     FinalizeQueries();
     FlushCsChunk();
     
@@ -195,17 +201,26 @@ namespace dxvk {
       D3D11_RESOURCE_DIMENSION resourceDim;
       pResource->GetType(&resourceDim);
 
+      // panDXVK v5: MapImage leaves a BC source slice here for remapped
+      // textures so the copy can happen at Unmap time instead.
+      m_pendingImageSlice = DxvkBufferSlice();
+
       D3D11_MAPPED_SUBRESOURCE mapInfo;
       HRESULT status = resourceDim == D3D11_RESOURCE_DIMENSION_BUFFER
         ? MapBuffer(pResource,              &mapInfo)
         : MapImage (pResource, Subresource, &mapInfo);
       
       if (unlikely(FAILED(status))) {
+        m_pendingImageSlice = DxvkBufferSlice();
         *pMappedResource = D3D11_MAPPED_SUBRESOURCE();
         return status;
       }
       
       AddMapEntry(pResource, Subresource, resourceDim, mapInfo);
+
+      if (auto* entry = FindMapEntry(pResource, Subresource))
+        entry->ImageSlice = std::move(m_pendingImageSlice);
+
       *pMappedResource = mapInfo;
       return S_OK;
     } else if (MapType == D3D11_MAP_WRITE_NO_OVERWRITE) {
@@ -232,7 +247,13 @@ namespace dxvk {
   void STDMETHODCALLTYPE D3D11DeferredContext::Unmap(
           ID3D11Resource*             pResource,
           UINT                        Subresource) {
-    // No-op, updates are committed in Map
+    // panDXVK v5: for BC→ASTC remapped textures the image update is
+    // deferred to here so we can transcode what the application wrote.
+    // For everything else this remains a no-op (updates commit in Map).
+    if (auto* entry = FindMapEntry(pResource, Subresource)) {
+      if (entry->ImageSlice.buffer() != nullptr)
+        CommitPendingImageUpload(*entry);
+    }
   }
   
   
@@ -346,10 +367,66 @@ namespace dxvk {
     pMappedResource->DepthPitch = layout.DepthPitch;
     pMappedResource->pData      = dataSlice.mapPtr(0);
 
+    // panDXVK v5: the image is ASTC but this buffer is sized and pitched
+    // for BC, because that is what the application will write into it.
+    // Pushing it now would hand copyBufferToImage BC bytes as if they
+    // were tightly packed ASTC. Defer the copy to Unmap instead.
+    if (pTexture->GetDataFormat() != packedFormat) {
+      m_pendingImageSlice = std::move(dataSlice);
+      return S_OK;
+    }
+
     UpdateImage(pTexture, &subresource,
       VkOffset3D { 0, 0, 0 }, levelExtent,
       std::move(dataSlice));
     return S_OK;
+  }
+
+
+  void D3D11DeferredContext::CommitPendingImageUpload(
+    const D3D11DeferredContextMapEntry&   Entry) {
+    D3D11CommonTexture* pTexture = GetCommonTexture(Entry.Resource.Get());
+
+    if (pTexture == nullptr || Entry.ImageSlice.buffer() == nullptr)
+      return;
+
+    VkFormat packedFormat = pTexture->GetPackedFormat();
+    auto formatInfo = imageFormatInfo(packedFormat);
+    auto subresource = pTexture->GetSubresourceFromIndex(
+        formatInfo->aspectMask, Entry.Resource.GetSubresource());
+
+    VkExtent3D levelExtent = pTexture->MipLevelExtent(subresource.mipLevel);
+    auto layout = pTexture->GetSubresourceLayout(formatInfo->aspectMask, Entry.Resource.GetSubresource());
+
+    VkDeviceSize astcSlicePitch = util::computeAstcImageDataSize(
+      levelExtent.width, levelExtent.height);
+
+    DxvkBufferSlice dstSlice = AllocStagingBuffer(
+      astcSlicePitch * VkDeviceSize(levelExtent.depth));
+
+    auto* dstPtr = static_cast<uint8_t*>(dstSlice.mapPtr(0));
+    auto* srcPtr = static_cast<const uint8_t*>(Entry.ImageSlice.mapPtr(0));
+
+    // Transcode is 2D-only: one pass per depth slice.
+    for (uint32_t z = 0; z < levelExtent.depth; z++) {
+      util::transcodeBcToAstc(pTexture->Desc()->Format,
+        srcPtr + VkDeviceSize(z) * layout.DepthPitch,
+        levelExtent.width, levelExtent.height, layout.RowPitch,
+        dstPtr + VkDeviceSize(z) * astcSlicePitch,
+        0 /* dstRowPitch 0 → core derives tight ASTC row pitch */);
+    }
+
+    UpdateImage(pTexture, &subresource,
+      VkOffset3D { 0, 0, 0 }, levelExtent,
+      std::move(dstSlice));
+  }
+
+
+  void D3D11DeferredContext::CommitAllPendingImageUploads() {
+    for (const auto& entry : m_mappedResources) {
+      if (entry.ImageSlice.buffer() != nullptr)
+        CommitPendingImageUpload(entry);
+    }
   }
   
   

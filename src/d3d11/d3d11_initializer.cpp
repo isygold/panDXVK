@@ -127,11 +127,10 @@ namespace dxvk {
     VkFormat packedFormat = m_parent->LookupPackedFormat(desc->Format, pTexture->GetFormatMode()).Format;
     auto formatInfo = imageFormatInfo(packedFormat);
 
-    // panDXVK: layout math + packing must use the REAL (possibly remapped)
-    // data format. m_packedFormat stays BC so UpdateTexture keeps firing.
-    VkFormat dataFormat = pTexture->GetDataFormat();
-    auto dataFormatInfo = imageFormatInfo(dataFormat);
-    const bool remapped = (dataFormat != packedFormat);
+    // panDXVK v5: is this texture's VkImage ASTC rather than BC?
+    // Staging textures never report remapped (they have no image), so they
+    // take the plain BC path on every branch below.
+    const bool remapped = pTexture->GetDataFormat() != packedFormat;
 
     if (pInitialData != nullptr && pInitialData->pSysMem != nullptr) {
       // pInitialData is an array that stores an entry for
@@ -145,26 +144,14 @@ namespace dxvk {
           VkOffset3D mipLevelOffset = { 0, 0, 0 };
           VkExtent3D mipLevelExtent = pTexture->MipLevelExtent(level);
 
-          // panDXVK: remapped textures hold ASTC, but initial data is BC.
-          // Transcode first so every upload path below sees ASTC data with
-          // ASTC pitch. (UpdateTexture hooks only cover later uploads.)
-          std::unique_ptr<uint8_t[]> transcoded;
-          const void* uploadData = pInitialData[id].pSysMem;
-          VkDeviceSize uploadPitch = pInitialData[id].SysMemPitch;
-          if (remapped) {
-            VkDeviceSize astcSize = util::computeAstcImageDataSize(
-              mipLevelExtent.width, mipLevelExtent.height);
-            transcoded = std::make_unique<uint8_t[]>(
-              static_cast<size_t>(astcSize));
-            util::transcodeBcToAstc(desc->Format,
-              static_cast<const uint8_t*>(pInitialData[id].pSysMem),
-              mipLevelExtent.width, mipLevelExtent.height,
-              pInitialData[id].SysMemPitch,
-              transcoded.get(), 0);
-            uploadData = transcoded.get();
-            uploadPitch = ((static_cast<VkDeviceSize>(mipLevelExtent.width) + 3) / 4) * 16;
-          }
-
+          // panDXVK v5: the two ingress seams below must NOT share data.
+          //
+          //  * image upload — the VkImage is ASTC, the initial data is BC,
+          //    so transcode here, once per depth slice (transcode is 2D-only).
+          //  * mapped-buffer pack — the buffer is app-visible storage and
+          //    always holds BC bytes, so pack the ORIGINAL data with BC
+          //    layout. Packing transcoded ASTC into it would overrun the
+          //    BC-sized allocation as well as lie to Map().
           if (mapMode != D3D11_COMMON_TEXTURE_MAP_MODE_STAGING) {
             m_transferCommands += 1;
             m_transferMemory   += pTexture->GetSubresourceLayout(formatInfo->aspectMask, id).Size;
@@ -176,11 +163,40 @@ namespace dxvk {
             subresourceLayers.layerCount     = 1;
 
             if (formatInfo->aspectMask != (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) {
+              const void*  uploadData       = pInitialData[id].pSysMem;
+              VkDeviceSize uploadPitch      = pInitialData[id].SysMemPitch;
+              VkDeviceSize uploadSlicePitch = pInitialData[id].SysMemSlicePitch;
+              std::unique_ptr<uint8_t[]> transcoded;
+
+              if (remapped) {
+                VkDeviceSize astcSlicePitch = util::computeAstcImageDataSize(
+                  mipLevelExtent.width, mipLevelExtent.height);
+
+                transcoded = std::make_unique<uint8_t[]>(
+                  static_cast<size_t>(astcSlicePitch * mipLevelExtent.depth));
+
+                auto* astcPtr = transcoded.get();
+
+                for (uint32_t z = 0; z < mipLevelExtent.depth; z++) {
+                  util::transcodeBcToAstc(desc->Format,
+                    static_cast<const uint8_t*>(pInitialData[id].pSysMem)
+                      + VkDeviceSize(z) * pInitialData[id].SysMemSlicePitch,
+                    mipLevelExtent.width, mipLevelExtent.height,
+                    pInitialData[id].SysMemPitch,
+                    astcPtr + z * astcSlicePitch,
+                    0 /* dstRowPitch 0 → core derives tight ASTC row pitch */);
+                }
+
+                uploadData       = transcoded.get();
+                uploadPitch      = ((static_cast<VkDeviceSize>(mipLevelExtent.width) + 3) / 4) * 16;
+                uploadSlicePitch = astcSlicePitch;
+              }
+
               m_context->uploadImage(
                 image, subresourceLayers,
                 uploadData,
                 uploadPitch,
-                pInitialData[id].SysMemSlicePitch);
+                uploadSlicePitch);
             } else {
               m_context->updateDepthStencilImage(
                 image, subresourceLayers,
@@ -195,8 +211,11 @@ namespace dxvk {
 
           if (mapMode != D3D11_COMMON_TEXTURE_MAP_MODE_NONE) {
             util::packImageData(pTexture->GetMappedBuffer(id)->mapPtr(0),
-              uploadData, uploadPitch, pInitialData[id].SysMemSlicePitch,
-              0, 0, pTexture->GetVkImageType(), mipLevelExtent, 1, dataFormatInfo, dataFormatInfo->aspectMask);
+              pInitialData[id].pSysMem,
+              pInitialData[id].SysMemPitch,
+              pInitialData[id].SysMemSlicePitch,
+              0, 0, pTexture->GetVkImageType(), mipLevelExtent, 1,
+              formatInfo, formatInfo->aspectMask);
           }
         }
       }
@@ -232,6 +251,11 @@ namespace dxvk {
   void D3D11Initializer::InitHostVisibleTexture(
           D3D11CommonTexture*         pTexture,
     const D3D11_SUBRESOURCE_DATA*     pInitialData) {
+    // panDXVK v5: only reachable with map mode DIRECT, and the texture
+    // ctor forces DIRECT→BUFFER for every BC→ASTC remapped texture, so
+    // this path can never see an ASTC image with BC initial data. The
+    // memcpy below is therefore always BC→BC. Keep that invariant if the
+    // force in d3d11_texture.cpp is ever revisited.
     Rc<DxvkImage> image = pTexture->GetImage();
 
     for (uint32_t layer = 0; layer < image->info().numLayers; layer++) {

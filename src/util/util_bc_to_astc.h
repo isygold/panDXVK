@@ -436,8 +436,11 @@ namespace dxvk::util {
     VkDeviceSize dstSize = computeAstcImageDataSize(width, height);
     auto dstData = std::make_unique<uint8_t[]>(static_cast<size_t>(dstSize));
 
+    // Destination row pitch must be the ASTC block row size
+    // ((width+3)/4)*16, NOT width*4 — those differ whenever
+    // width is not a multiple of 4. 0 = let the core derive it.
     transcodeBcToAstc(bcFormat, srcData, width, height,
-                      srcRowPitch, dstData.get(), width * 4);
+                      srcRowPitch, dstData.get(), 0);
 
     return dstData;
   }
@@ -474,7 +477,7 @@ namespace dxvk::util {
     transcodeBcBlocksToAstc(bc, remapR, remapG, bc6hSigned,
       srcData, width, height,
       static_cast<uint32_t>(srcRowPitch),
-      dstData.get(), width * 4);
+      dstData.get(), 0);
 
     return dstData;
   }

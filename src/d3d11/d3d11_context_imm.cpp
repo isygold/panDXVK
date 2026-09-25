@@ -4,6 +4,8 @@
 #include "d3d11_fence.h"
 #include "d3d11_texture.h"
 
+#include "../util/util_bc_to_astc.h"
+
 constexpr static uint32_t MinFlushIntervalUs = 750;
 constexpr static uint32_t IncFlushIntervalUs = 250;
 constexpr static uint32_t MaxPendingSubmits  = 6;
@@ -629,10 +631,43 @@ namespace dxvk {
       // we need to copy its contents into the image
       VkImageAspectFlags aspectMask = imageFormatInfo(pResource->GetPackedFormat())->aspectMask;
       VkImageSubresource subresource = pResource->GetSubresourceFromIndex(aspectMask, Subresource);
+      VkExtent3D mipExtent = pResource->MipLevelExtent(subresource.mipLevel);
+
+      DxvkBufferSlice srcSlice(pResource->GetMappedBuffer(Subresource));
+
+      // panDXVK v5 — Map/Unmap CPU ingress seam.
+      // The mapped buffer holds app-visible BC bytes while the VkImage is
+      // ASTC, so transcode right here, at the CPU→image boundary, before
+      // UpdateImage. UpdateImage's image path requires a tightly packed
+      // buffer in the image's own format (row/slice alignment 0 = tight),
+      // which is exactly what the transcoded output is.
+      if (pResource->GetDataFormat() != pResource->GetPackedFormat()) {
+        auto bcLayout = pResource->GetSubresourceLayout(aspectMask, Subresource);
+
+        VkDeviceSize astcSlicePitch = util::computeAstcImageDataSize(
+          mipExtent.width, mipExtent.height);
+
+        DxvkBufferSlice dstSlice = AllocStagingBuffer(
+          astcSlicePitch * VkDeviceSize(mipExtent.depth));
+
+        auto* dstPtr = static_cast<uint8_t*>(dstSlice.mapPtr(0));
+        auto* srcPtr = static_cast<const uint8_t*>(srcSlice.mapPtr(0))
+                     + bcLayout.Offset;
+
+        // Transcode is 2D-only: run it once per depth slice.
+        for (uint32_t z = 0; z < mipExtent.depth; z++) {
+          util::transcodeBcToAstc(pResource->Desc()->Format,
+            srcPtr + VkDeviceSize(z) * bcLayout.DepthPitch,
+            mipExtent.width, mipExtent.height, bcLayout.RowPitch,
+            dstPtr + VkDeviceSize(z) * astcSlicePitch,
+            0 /* dstRowPitch 0 → core derives tight ASTC row pitch */);
+        }
+
+        srcSlice = std::move(dstSlice);
+      }
 
       UpdateImage(pResource, &subresource, VkOffset3D { 0, 0, 0 },
-        pResource->MipLevelExtent(subresource.mipLevel),
-        DxvkBufferSlice(pResource->GetMappedBuffer(Subresource)));
+        mipExtent, std::move(srcSlice));
     }
   }
   

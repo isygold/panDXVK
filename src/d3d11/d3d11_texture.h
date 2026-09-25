@@ -243,14 +243,20 @@ namespace dxvk {
     }
 
     /**
-     * \brief Returns the format describing the actual image/memory layout
+     * \brief Returns the format of the texture's VkImage, if any
      *
-     * panDXVK: for BC→ASTC remapped textures this is the ASTC format,
-     * otherwise identical to GetPackedFormat(). All block-size and pitch
-     * math MUST use this (never the packed BC format) so Map/staging
-     * computations match the real allocation. GetPackedFormat() stays BC
-     * so UpdateTexture keeps triggering the transcode.
-     * \returns Data-layout Vulkan format
+     * panDXVK v5: this is the ASTC format only when the texture is a
+     * BC→ASTC remapped texture that actually owns a VkImage
+     * (map mode != STAGING). For all other textures, including remapped
+     * STAGING resources, it is identical to GetPackedFormat().
+     *
+     * Therefore (GetDataFormat() != GetPackedFormat()) is the canonical
+     * "this texture's image is ASTC" predicate used by the transcode
+     * seams (UpdateTexture, CopyImage, UnmapImage, initializer).
+     *
+     * Map/staging layout math must NOT use this: mapped buffers always
+     * hold app-visible (BC) data and use GetPackedFormat().
+     * \returns Image Vulkan format, or the packed format when no image
      */
     VkFormat GetDataFormat() const {
       return m_transcodedFormat != VK_FORMAT_UNDEFINED
@@ -407,8 +413,10 @@ namespace dxvk {
     D3D11_COMMON_TEXTURE_MAP_MODE m_mapMode;
     DXGI_USAGE                    m_dxgiUsage;
     VkFormat                      m_packedFormat;
-    // panDXVK: ASTC format for BC→ASTC remapped textures (UNDEFINED
-    // otherwise). Drives all layout/pitch math via GetDataFormat().
+    // panDXVK v5: ASTC format set only for remapped textures that own a
+    // VkImage (map mode != STAGING); UNDEFINED otherwise (staging stays BC).
+    // Gates every CPU→image transcode seam via GetDataFormat() !=
+    // GetPackedFormat(). Never used for layout math.
     VkFormat                      m_transcodedFormat = VK_FORMAT_UNDEFINED;
     
     Rc<DxvkImage>                 m_image;

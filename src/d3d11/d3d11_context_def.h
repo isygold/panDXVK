@@ -21,6 +21,11 @@ namespace dxvk {
 
     D3D11ResourceRef          Resource;
     D3D11_MAPPED_SUBRESOURCE  MapInfo;
+    // panDXVK v5: non-empty only for BC→ASTC remapped textures mapped
+    // through a deferred context. Holds the BC source buffer the app
+    // writes into; the actual image update happens in Unmap, where we
+    // can transcode it. Empty for buffers and non-remapped textures.
+    DxvkBufferSlice           ImageSlice;
   };
   
   class D3D11DeferredContext : public D3D11DeviceContext {
@@ -113,6 +118,10 @@ namespace dxvk {
     // here is reasonable since there will usually only be a small
     // number of mapped resources per command list.
     std::vector<D3D11DeferredContextMapEntry> m_mappedResources;
+
+    // panDXVK v5: slice handed out by MapImage for a remapped texture,
+    // transferred into the matching map entry by Map().
+    DxvkBufferSlice m_pendingImageSlice;
     
     // Begun and ended queries, will also be stored in command list
     std::vector<Com<D3D11Query, false>> m_queriesBegun;
@@ -125,6 +134,13 @@ namespace dxvk {
             ID3D11Resource*               pResource,
             UINT                          Subresource,
             D3D11_MAPPED_SUBRESOURCE*     pMappedResource);
+
+    // panDXVK v5: transcode the BC bytes the app wrote into a deferred
+    // map and push them into the (ASTC) image.
+    void CommitPendingImageUpload(
+      const D3D11DeferredContextMapEntry&   Entry);
+
+    void CommitAllPendingImageUploads();
 
     void UpdateMappedBuffer(
             D3D11Buffer*                  pDstBuffer,

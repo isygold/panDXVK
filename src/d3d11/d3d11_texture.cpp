@@ -41,10 +41,11 @@ namespace dxvk {
         formatInfo.Format = astcFormat;
         formatFamily.FormatCount = 1;
         formatFamily.Formats[0] = astcFormat;
-        // Record the real layout format so pitch/offset math below uses
-        // ASTC block sizes, not the stale BC ones. m_packedFormat stays BC
-        // so UpdateTexture keeps triggering the transcode.
-        m_transcodedFormat = astcFormat;
+        // panDXVK: m_transcodedFormat is intentionally NOT set here.
+        // The remap only takes effect once we know the texture will own a
+        // real VkImage (map mode != STAGING). Staging resources stay pure
+        // BC end-to-end: they hold BC bytes and report BC layout/pitch.
+        // See the gate after DetermineMapMode() below.
       }
     }
 
@@ -181,7 +182,28 @@ namespace dxvk {
     
     // Determine map mode based on our findings
     m_mapMode = DetermineMapMode(&imageInfo);
-    
+
+    // panDXVK: BC→ASTC remap gate.
+    //
+    // v5 rule: the remap is only recorded for textures that will own a
+    // VkImage (map mode != STAGING). Staging textures keep GetDataFormat()
+    // == GetPackedFormat() (BC), so their layout math, UpdateTexture gate
+    // and CopyImage branches all see them as non-remapped.
+    //
+    // Additionally we force DIRECT -> BUFFER for remapped textures. Linear
+    // tiling with ASTC image format would otherwise hand the app ASTC pitches
+    // from querySubresourceLayout while the mapped host buffer is filled via
+    // BC paths, and HOST_VISIBLE ASTC storage is not a Mali use case anyway.
+    // Forcing BUFFER also makes Hole #1 (InitHostVisibleTexture) structurally
+    // unreachable for remapped textures.
+    if (astcFormat != VK_FORMAT_UNDEFINED) {
+      if (m_mapMode != D3D11_COMMON_TEXTURE_MAP_MODE_STAGING) {
+        m_transcodedFormat = astcFormat;
+        if (m_mapMode == D3D11_COMMON_TEXTURE_MAP_MODE_DIRECT)
+          m_mapMode = D3D11_COMMON_TEXTURE_MAP_MODE_BUFFER;
+      }
+    }
+
     // If the image is mapped directly to host memory, we need
     // to enable linear tiling, and DXVK needs to be aware that
     // the image can be accessed by the host.
@@ -256,7 +278,10 @@ namespace dxvk {
   
   
   VkDeviceSize D3D11CommonTexture::ComputeMappedOffset(UINT Subresource, UINT Plane, VkOffset3D Offset) const {
-    auto packedFormatInfo = imageFormatInfo(GetDataFormat());
+    // panDXVK v5: the mapped buffer always holds app-visible (BC) data, so
+    // block/element math uses the packed format. For remapped textures the
+    // DIRECT case is unreachable (forced to BUFFER in the ctor).
+    auto packedFormatInfo = imageFormatInfo(GetPackedFormat());
 
     VkImageAspectFlags aspectMask = packedFormatInfo->aspectMask;
     VkDeviceSize elementSize = packedFormatInfo->elementSize;
@@ -308,7 +333,10 @@ namespace dxvk {
       case D3D11_COMMON_TEXTURE_MAP_MODE_NONE:
       case D3D11_COMMON_TEXTURE_MAP_MODE_BUFFER:
       case D3D11_COMMON_TEXTURE_MAP_MODE_STAGING: {
-        auto packedFormatInfo = imageFormatInfo(GetDataFormat());
+        // panDXVK v5: mapped/staging buffers hold BC bytes. Use the packed
+        // format so row pitches and slice sizes match the app's Map() view
+        // (and the BC-sized allocation made by CreateMappedBuffer).
+        auto packedFormatInfo = imageFormatInfo(GetPackedFormat());
 
         VkImageAspectFlags aspects = packedFormatInfo->aspectMask;
         VkExtent3D mipExtent = MipLevelExtent(subresource.mipLevel);
