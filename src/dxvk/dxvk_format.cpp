@@ -7,7 +7,7 @@ namespace dxvk {
   constexpr VkColorComponentFlags RG   = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT;
   constexpr VkColorComponentFlags R    = VK_COLOR_COMPONENT_R_BIT;
 
-  const std::array<DxvkFormatInfo, 152> g_formatInfos = {{
+  const std::array<DxvkFormatInfo, 154> g_formatInfos = {{
     // VK_FORMAT_UNDEFINED
     { },
     
@@ -561,15 +561,47 @@ namespace dxvk {
       DxvkFormatFlag::MultiPlane, VkExtent3D { 1, 1, 1 },
       { DxvkPlaneFormatInfo { 1, { 1, 1 } },
         DxvkPlaneFormatInfo { 2, { 2, 2 } } } },
+
+    // panDXVK: VK_FORMAT_ASTC_4x4_UNORM_BLOCK
+    // Backing format for the BC->ASTC transcode path. Without this entry
+    // imageFormatInfo() returns nullptr for ASTC and every aspectMask /
+    // elementSize read dereferences null + 0x0c (crash observed at
+    // d3d11+0x60731 across three games).
+    { 16, RGBA, VK_IMAGE_ASPECT_COLOR_BIT,
+      DxvkFormatFlag::BlockCompressed,
+      VkExtent3D { 4, 4, 1 } },
+
+    // panDXVK: VK_FORMAT_ASTC_4x4_SRGB_BLOCK
+    { 16, RGBA, VK_IMAGE_ASPECT_COLOR_BIT,
+      DxvkFormatFlags(
+        DxvkFormatFlag::BlockCompressed,
+        DxvkFormatFlag::ColorSpaceSrgb),
+      VkExtent3D { 4, 4, 1 } },
   }};
   
   
-  const std::array<std::pair<VkFormat, VkFormat>, 4> g_formatGroups = {{
+  const std::array<std::pair<VkFormat, VkFormat>, 5> g_formatGroups = {{
     { VK_FORMAT_UNDEFINED,                  VK_FORMAT_BC7_SRGB_BLOCK            },
     { VK_FORMAT_G8B8G8R8_422_UNORM_KHR,     VK_FORMAT_B8G8R8G8_422_UNORM_KHR    },
     { VK_FORMAT_A4R4G4B4_UNORM_PACK16_EXT,  VK_FORMAT_A4B4G4R4_UNORM_PACK16_EXT },
     { VK_FORMAT_G8_B8R8_2PLANE_420_UNORM,   VK_FORMAT_G8_B8R8_2PLANE_420_UNORM  },
+    { VK_FORMAT_ASTC_4x4_UNORM_BLOCK,       VK_FORMAT_ASTC_4x4_SRGB_BLOCK       },
   }};
+
+
+  // panDXVK: imageFormatInfo() walks g_formatGroups in order, accumulating
+  // each non-matching group's span into indexOffset, then indexes
+  // g_formatInfos with that offset. If the array size and the summed group
+  // span ever disagree, lookups silently land on the wrong entry or off the
+  // end of the array. Keep the two tied together at compile time.
+  static_assert(
+      (uint32_t(VK_FORMAT_BC7_SRGB_BLOCK) - uint32_t(VK_FORMAT_UNDEFINED) + 1)
+    + (uint32_t(VK_FORMAT_B8G8R8G8_422_UNORM_KHR) - uint32_t(VK_FORMAT_G8B8G8R8_422_UNORM_KHR) + 1)
+    + (uint32_t(VK_FORMAT_A4B4G4R4_UNORM_PACK16_EXT) - uint32_t(VK_FORMAT_A4R4G4B4_UNORM_PACK16_EXT) + 1)
+    + (uint32_t(VK_FORMAT_G8_B8R8_2PLANE_420_UNORM) - uint32_t(VK_FORMAT_G8_B8R8_2PLANE_420_UNORM) + 1)
+    + (uint32_t(VK_FORMAT_ASTC_4x4_SRGB_BLOCK) - uint32_t(VK_FORMAT_ASTC_4x4_UNORM_BLOCK) + 1)
+    == 154,
+    "g_formatInfos size must equal the summed span of g_formatGroups");
   
   
   const DxvkFormatInfo* imageFormatInfo(VkFormat format) {

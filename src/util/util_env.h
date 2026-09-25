@@ -77,3 +77,27 @@ namespace dxvk::env {
   bool createDirectory(const std::string& path);
   
 }
+
+
+namespace dxvk::util {
+
+  /**
+   * \brief Test-build override: force BC→ASTC even when the driver
+   * claims BC support (e.g. wrapper BCN layer faking the feature).
+   *
+   * Opt-in via PANDXVK_FORCE_TRANSCODE=1 (any value except unset/empty/"0").
+   * Explicitly a testing knob: forcing transcode adds CPU cost + ASTC loss
+   * on setups where the wrapper path renders fine. Cached on first call.
+   *
+   * Lives here rather than in util_bc_to_astc.h because the DXVK core layer
+   * (DxvkAdapter::isPanVkTranscode) needs it and must not pull in DXGI types.
+   */
+  inline bool forceTranscodeEnabled() {
+    static const bool enabled = [] {
+      const std::string v = env::getEnvVar("PANDXVK_FORCE_TRANSCODE");
+      return !v.empty() && v != "0";
+    }();
+    return enabled;
+  }
+
+}

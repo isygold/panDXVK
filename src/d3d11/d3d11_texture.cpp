@@ -26,9 +26,9 @@ namespace dxvk {
     // BC textureCompressionBC is not supported on panVK.
     // Skip if the driver already supports BC (blob driver on G610+).
     VkFormat astcFormat = VK_FORMAT_UNDEFINED;
-    if (m_device->GetDXVKDevice()->adapter()->isPanVk()
-        && (util::forceTranscodeEnabled()
-            || !m_device->GetDXVKDevice()->adapter()->features().core.features.textureCompressionBC)
+    // panDXVK: gate lives in DxvkAdapter::isPanVkTranscode() so the texture,
+    // RTV and SRV constructors cannot drift apart.
+    if (m_device->GetDXVKDevice()->adapter()->isPanVkTranscode()
         && util::isBcFormat(m_desc.Format)) {
       astcFormat = util::bcToAstcFormat(m_desc.Format);
       if (astcFormat != VK_FORMAT_UNDEFINED) {

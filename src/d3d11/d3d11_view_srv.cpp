@@ -82,10 +82,10 @@ namespace dxvk {
       viewInfo.swizzle = formatInfo.Swizzle;
       viewInfo.usage   = VK_IMAGE_USAGE_SAMPLED_BIT;
 
-      // panDXVK: Remap BC→ASTC format for PanVK image views
-      if (pDevice->GetDXVKDevice()->adapter()->isPanVk()
-          && (util::forceTranscodeEnabled()
-              || !pDevice->GetDXVKDevice()->adapter()->features().core.features.textureCompressionBC)
+      // panDXVK: Remap BC→ASTC format for PanVK image views.
+      // Shared gate — must not drift from the texture ctor, or a non-remapped
+      // BC image gets an ASTC view format.
+      if (pDevice->GetDXVKDevice()->adapter()->isPanVkTranscode()
           && util::isBcFormat(pDesc->Format)) {
         VkFormat astcFormat = util::bcToAstcFormat(pDesc->Format);
         if (astcFormat != VK_FORMAT_UNDEFINED) {

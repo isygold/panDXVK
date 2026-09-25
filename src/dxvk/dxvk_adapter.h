@@ -128,6 +128,28 @@ namespace dxvk {
     }
 
     /**
+     * \brief Tests whether BC formats should be remapped to ASTC 4x4
+     *
+     * panDXVK: single source of truth for the BC->ASTC remap gate. Shared by
+     * the D3D11 texture, RTV and SRV constructors — those three must stay in
+     * lockstep, because a texture created with one decision and given a view
+     * built from another yields an invalid VkImageView (or a BC image with an
+     * ASTC view format, which panVK cannot bind).
+     *
+     * Requires:
+     *  - a PanVK/Mali adapter,
+     *  - the driver exposing textureCompressionASTC_LDR (ASTC images are
+     *    illegal on a device that did not enable it), and
+     *  - either PANDXVK_FORCE_TRANSCODE=1, or no native BC support.
+     *
+     * Diagnostics: if transcode is wanted but impossible, createDevice()
+     * logs a one-time error naming the missing feature.
+     *
+     * \returns \c true if BC formats should be remapped to ASTC 4x4
+     */
+    bool isPanVkTranscode() const;
+
+    /**
      * \brief Retrieves memory heap info
      * 
      * Returns properties of all available memory heaps,

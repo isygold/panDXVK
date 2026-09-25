@@ -1965,6 +1965,11 @@ namespace dxvk {
       enabled.core.features.shaderClipDistance                    = VK_TRUE;
       enabled.core.features.shaderCullDistance                    = VK_TRUE;
       enabled.core.features.textureCompressionBC                  = VK_TRUE;
+      // panDXVK: the BC->ASTC transcode path creates VK_FORMAT_ASTC_4x4_*
+      // images, which are only legal on a device that enabled
+      // textureCompressionASTC_LDR. Without this bit vkCreateImage returns
+      // VK_ERROR_FORMAT_NOT_SUPPORTED.
+      enabled.core.features.textureCompressionASTC_LDR            = supported.core.features.textureCompressionASTC_LDR;
       enabled.extDepthClipEnable.depthClipEnable                  = supported.extDepthClipEnable.depthClipEnable;
       enabled.extHostQueryReset.hostQueryReset                    = VK_TRUE;
     }

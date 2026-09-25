@@ -5,6 +5,8 @@
 #include "dxvk_device.h"
 #include "dxvk_instance.h"
 
+#include "../util/util_env.h"
+
 namespace dxvk {
   
   DxvkAdapter::DxvkAdapter(
@@ -106,6 +108,14 @@ namespace dxvk {
     queues.graphics = graphicsQueue;
     queues.transfer = transferQueue;
     return queues;
+  }
+
+
+  bool DxvkAdapter::isPanVkTranscode() const {
+    return isPanVk()
+      && m_deviceFeatures.core.features.textureCompressionASTC_LDR
+      && (util::forceTranscodeEnabled()
+          || !m_deviceFeatures.core.features.textureCompressionBC);
   }
 
 
@@ -343,6 +353,43 @@ namespace dxvk {
 
     enabledFeatures.ext4444Formats.formatA4B4G4R4 = m_deviceFeatures.ext4444Formats.formatA4B4G4R4;
     enabledFeatures.ext4444Formats.formatA4R4G4B4 = m_deviceFeatures.ext4444Formats.formatA4R4G4B4;
+
+    // panDXVK: checkFeatureSupport() deliberately does not require five
+    // features on PanVK, because PanVK does not implement them:
+    //   geometryShader, multiViewport, shaderClipDistance,
+    //   shaderCullDistance, textureCompressionBC
+    // (Database: mali_dxvk_data.sql:415, mali_dxvk_geometry_shader_update.sql).
+    //
+    // That bypass only unblocks the feature *probe*. The corresponding
+    // entries in D3D11Device::GetDeviceFeatures() / d3d9_device are still
+    // forced to VK_TRUE and arrive here unfiltered, so vkCreateDevice would
+    // be handed features the device does not report and fail with
+    // VK_ERROR_FEATURE_NOT_PRESENT.
+    //
+    // Mirror the bypass: never request a feature we already decided not to
+    // require. Gated on isPanVk() so every other vendor's behaviour stays
+    // bit-identical to upstream.
+    if (isPanVk()) {
+      auto&       enabled   = enabledFeatures.core.features;
+      const auto& supported = m_deviceFeatures.core.features;
+
+      enabled.geometryShader       = enabled.geometryShader       && supported.geometryShader;
+      enabled.multiViewport        = enabled.multiViewport        && supported.multiViewport;
+      enabled.shaderClipDistance   = enabled.shaderClipDistance   && supported.shaderClipDistance;
+      enabled.shaderCullDistance   = enabled.shaderCullDistance   && supported.shaderCullDistance;
+      enabled.textureCompressionBC = enabled.textureCompressionBC && supported.textureCompressionBC;
+
+      // One-time, at device creation: transcode wanted but impossible.
+      // Without this the new ASTC arm of isPanVkTranscode() would disable
+      // remapping silently and the game would just show unrenderable BC
+      // textures with no hint in the log.
+      if ((util::forceTranscodeEnabled() || !supported.textureCompressionBC)
+       && !supported.textureCompressionASTC_LDR) {
+        Logger::err("panDXVK: BC->ASTC transcode unavailable: driver exposes "
+          "neither textureCompressionBC nor textureCompressionASTC_LDR. "
+          "BC textures will NOT be remapped and cannot be rendered.");
+      }
+    }
     
     Logger::info(str::format("Device properties:"
       "\n  Device name:     : ", m_deviceInfo.core.properties.deviceName,
