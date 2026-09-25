@@ -190,6 +190,25 @@ namespace dxvk {
                 uploadData       = transcoded.get();
                 uploadPitch      = ((static_cast<VkDeviceSize>(mipLevelExtent.width) + 3) / 4) * 16;
                 uploadSlicePitch = astcSlicePitch;
+
+#ifndef NDEBUG
+                // Metric: which subresource the initializer transcode
+                // consumed. The UpdateSubresource1 path owns the only other
+                // transcode logging (timings + force notice), so without this
+                // line a title that only ever calls the initializer shows zero
+                // transcode evidence and is indistinguishable from a gate that
+                // never opened. Fires once per layer/mip at resource creation,
+                // never per frame.
+                if (Logger::logLevel() >= LogLevel::Debug) {
+                  Logger::debug(str::format(
+                    "panDXVK: BC→ASTC initializer upload ",
+                    mipLevelExtent.width, "x", mipLevelExtent.height,
+                    " depth=", mipLevelExtent.depth,
+                    " DXGI_FORMAT=", desc->Format,
+                    " mip=", level, " layer=", layer,
+                    " ", astcSlicePitch * mipLevelExtent.depth, "B"));
+                }
+#endif
               }
 
               m_context->uploadImage(
