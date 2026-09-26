@@ -33,51 +33,35 @@ namespace dxvk::util {
   }
 
 
-  /**
-   * \brief Quantizes a weight to [0, maxVal]
-   *
-   * Maps [0.0, 1.0] → [0, maxVal]
-   */
-  inline uint32_t quantizeWeightTo(float w, uint32_t maxVal) {
-    return std::min(maxVal, static_cast<uint32_t>(w * maxVal + 0.5f));
-  }
-
-
-  /**
-   * \brief Quantizes a weight to N bits
-   *
-   * Maps [0.0, 1.0] → [0, (1<<n)-1]
-   */
-  inline uint32_t quantizeWeight(float w, uint32_t n) {
-    return quantizeWeightTo(w, (1u << n) - 1u);
-  }
-
-
   // ─── ASTC block header layout (Khronos GL_KHR_texture_compression_astc_ldr,
   //      Appendix C — cross-checked against Mesa texcompress_astc.cpp) ───────
   //
   // Table C.2.7 (2D Block Mode Layout), column order 10 → 0, row 1:
   //     D H  B   A   R0  0 0 R2 R1   →  Width = B+4, Height = A+2
   // with bit10=D, bit9=H, bits[8:7]=B, bits[6:5]=A, bit4=R0,
-  // bits[3:2]=00, bit1=R2, bit0=R1.
+  // bits[3:2]=00, bit1=R2, bit0=R1.  Table C.2.6 reads the 3-bit R as
+  // {R0, R2, R1} with R0 most significant.
   //
-  // D=0 (no dual plane), H=0 (low precision range), B=0, A=2 gives a
-  // 4x4 weight grid — exactly the block footprint, so the weight infill
-  // (C.2.18) degenerates to an identity mapping, texel i ← grid[i].
+  // D=0 (no dual plane), H=1 (high precision range), B=0 → Width = 4,
+  // A=2 → Height = 4 gives a 4x4 weight grid — exactly the block
+  // footprint, so the weight infill (C.2.18) degenerates to an identity
+  // mapping, texel i ← grid[i].
   //
-  // R = {R0, R2, R1} = 101, with H=0, selects Table C.2.6 row R=101:
-  //     Weight Range 0..4, 1 quint per weight.
-  // R2,R1 must not both be zero — that is what disambiguates row 1 from
-  // the rows whose bits[1:0] are 00.
+  // R = {R0, R2, R1} = 010 with H=1 selects Table C.2.6 row R=010:
+  //     Weight Range 0..9 — 1 quint + 1 LSB per weight, 10 levels.
   //
-  //     bit6 = 1 (A=2), bit4 = 1 (R0=1), bit0 = 1 (R1=1)
-  //     → 0b0101_0001 = 0x51
+  //     bit9 = 1 (H=1), bit6 = 1 (A=2), bit1 = 1 (R2=1)
+  //     → 0b010_0100_0010 = 0x242
   //
-  // Note: 2-bit weights (R=100) are NOT expressible on a 4x4 grid — that
-  // range only appears in rows whose grids are >= 6 in one axis, which
-  // would exceed the 4x4 footprint and make the whole block decode to the
-  // error colour.  Quint (5 levels) is the finest range that fits.
-  constexpr uint32_t kAstcBlockMode4x4Quint = 0x51u;
+  // R2 and R1 cannot both be zero — that is what disambiguates row 1 from
+  // rows 6-10, whose bits[1:0] are 00.
+  //
+  // 10 weight levels replace the former 5 (block mode 0x51, 1 quint per
+  // weight).  The cost is one endpoint bit per value: remaining_bits =
+  // 128 - 17 - 54 = 57, so C.2.13 selects the 0..127 (7-bit) endpoint
+  // range, 8 x 7 = 56 bits, leaving exactly one padding bit.  On real
+  // content this is worth +2.09 dB (measured, rtr_astc gate --rt).
+  constexpr uint32_t kAstcBlockMode4x4 = 0x242u;
 
   // Table C.2.4 (Single-partition block layout):
   //     bits[10:0]  block mode
@@ -88,34 +72,48 @@ namespace dxvk::util {
   constexpr uint32_t kAstcCemBitOffset    = 13u;
   constexpr uint32_t kAstcConfigBits      = 17u;
 
-  // Endpoint data: 8 values x 8 bits, packed with ISE immediately above
-  // the config bits (C.2.13, "growing upwards").
-  constexpr uint32_t kAstcEndpointBitOffset = 17u;
+  // Endpoint data: 8 values x 7 bits, packed with ISE immediately above
+  // the config bits (C.2.13, "growing upwards").  Bit-only ranges pack
+  // value i at kAstcEndpointBitOffset + i * kAstcEndpointValueBits.
+  // C.2.13: "For bit-only representations, this is simple bit
+  // replication from the most significant bit" back to 0..255.
+  constexpr uint32_t kAstcEndpointBitOffset  = 17u;
+  constexpr uint32_t kAstcEndpointValueBits  = 7u;
+  constexpr uint32_t kAstcEndpointValues     = 8u;
+  constexpr uint32_t kAstcEndpointBits       =
+    kAstcEndpointValues * kAstcEndpointValueBits; // 56
 
-  // Weights: 16 values, 1 quint each. ISE groups 3 quints into 7 bits
-  // (C.2.13, group size = 7 + 3*n with n = 0 LSB bits); the final partial
-  // group of a single quint costs 3 bits:
-  //     5 * 7 + 3 = 38 bits.
-  // The weight stream grows DOWNWARDS from the top of the block
-  // (C.2.16): stream bit n == block bit (127 - n).
-  constexpr uint32_t kAstcWeightBits     = 38u;
-  constexpr uint32_t kAstcWeightBitOffset = 128u - kAstcWeightBits; // 90
+  // Weights: 16 values, 1 quint + 1 LSB each (range 0..9).  C.2.12 packs
+  // 3 values into a (7 + 3*n)-bit group with n = 1 LSB bit → 10 bits:
+  //     m0 | Q[2:0] | m1 | Q[4:3] | m2 | Q[6:5]
+  // Five full groups plus a trailing partial group of one value
+  // (1 LSB + ceil(1*7/3) = 4 bits) gives 5 * 10 + 4 = 54 bits, matching
+  // ceil(16*7/3) + 16*1 = 38 + 16.  The weight stream grows DOWNWARDS
+  // from the top of the block (C.2.16): stream bit n == block bit
+  // (127 - n).
+  constexpr uint32_t kAstcWeightLevels    = 10u;
+  constexpr uint32_t kAstcWeightBits      = 54u;
+  constexpr uint32_t kAstcWeightBitOffset = 128u - kAstcWeightBits; // 74
 
-  // config(17) + endpoints(64) + weights(38) = 119; 9 padding bits remain
-  // at [89:81].  remaining_bits for endpoint range selection is
-  // 128 - 17 - 38 = 73 >= 64, so the decoder derives the 0..255 (8-bit)
-  // endpoint range — the values below are stored verbatim.
+  // config(17) + endpoints(56) + padding(1) + weights(54) = 128.
+  // remaining_bits for endpoint range selection is 128 - 17 - 54 = 57,
+  // and 8 x 7 = 56 <= 57, so the decoder derives the 0..127 (7-bit)
+  // endpoint range — the values below are stored as 7-bit quantities.
 
-  static_assert(kAstcBlockMode4x4Quint <= 0x7FFu,
+  static_assert(kAstcBlockMode4x4 <= 0x7FFu,
     "block mode field is 11 bits wide");
   static_assert(kAstcCemRgbaDirect <= 0xFu,
     "CEM field is 4 bits wide");
   static_assert(kAstcEndpointBitOffset == kAstcConfigBits,
     "endpoint data starts immediately after the config bits");
-  static_assert(kAstcEndpointBitOffset + 64u <= kAstcWeightBitOffset,
-    "64 endpoint bits must not collide with the weight stream");
+  static_assert(kAstcEndpointBitOffset + kAstcEndpointBits
+                  == kAstcWeightBitOffset - 1u,
+    "exactly one padding bit sits between the endpoints and the weights");
   static_assert(kAstcWeightBitOffset + kAstcWeightBits == 128u,
     "the weight stream must end exactly at the top of the block");
+  static_assert(128u - kAstcConfigBits - kAstcWeightBits
+                  >= kAstcEndpointBits,
+    "remaining_bits must be able to hold the endpoint stream");
 
 
   /**
@@ -188,33 +186,119 @@ namespace dxvk::util {
 
 
   /**
-   * \brief Packs 16 quint weights into the 38-bit ISE weight stream
+   * \brief Unquantizes a weight index in range 0..9 (Table C.2.17)
    *
-   * Five full groups of three (7 bits each) plus a trailing partial group
-   * of one quint (3 bits).  The partial group stores the value directly:
-   * with Q[6:3] = 0 and Q[2:0] <= 4 the decode yields q0 = Q[2:0].
+   * Column "0..9" of Table C.2.17 carries T Q B = 1 1 1 with
+   * B = 000000000, C = 28 for the weight table and D = the quint value;
+   * A is 127 when the LSB is set and 0 when it is not.  C.2.17 then
+   * processes them as:
    *
-   * \param [in] w  16 weights, each 0..4
+   *     T = D * C + B;  T ^= A;  T = (A & 0x20) | (T >> 2);
+   *     if (T > 32) T += 1;
+   *
+   * yielding {0, 7, 14, 21, 28, 36, 43, 50, 57, 64} — evenly spaced across
+   * the 0..64 weight scale.
+   *
+   * The index -> value map is NOT monotonic (index 1 -> 64, index 2 -> 7),
+   * exactly the scrambling C.2.13 warns about for endpoints.  An encoder
+   * must therefore pick the index whose *unquantized value* is nearest
+   * its target; scaling the index directly lands on the wrong weight.
+   *
+   * \param [in] idx  weight index, 0..9
+   * \returns         unquantized weight on the 0..64 scale
+   */
+  inline uint32_t unquantWeightQuint1(uint32_t idx) {
+    const uint32_t A = (idx & 1u) ? 127u : 0u;
+    const uint32_t B = 0u;
+    const uint32_t C = 28u;
+    const uint32_t D = (idx >> 1) & 7u;
+
+    uint32_t T = D * C + B;
+    T = T ^ A;
+    T = (A & 0x20u) | (T >> 2);
+    if (T > 32u)
+      T += 1u;
+    return T;
+  }
+
+
+  /**
+   * \brief Quantizes t in [0,1] to the weight index nearest it
+   *
+   * Targets the 0..64 scale directly and compares *unquantized* values,
+   * because unquantWeightQuint1() is not monotonic in the index.
+   * Ties resolve to the lowest index, which is what the independently
+   * written candidate encoder in rtr_astc/gate.cpp does, so the two
+   * produce identical blocks.
+   *
+   * \param [in] t  interpolation factor along the endpoint pair, [0,1]
+   * \returns       weight index, 0..9
+   */
+  inline uint32_t quantizeWeightQuint1(float t) {
+    if (!(t > 0.0f))
+      return 0u;   // t <= 0, or NaN — treat as the block minimum
+    if (t > 1.0f)
+      t = 1.0f;
+
+    const uint32_t target = static_cast<uint32_t>(t * 64.0f + 0.5f);
+    uint32_t best = 0;
+    uint32_t bestErr = 0xFFFFFFFFu;
+
+    for (uint32_t i = 0; i < kAstcWeightLevels; i++) {
+      const uint32_t u = unquantWeightQuint1(i);
+      const uint32_t e = (u > target) ? (u - target) : (target - u);
+      if (e < bestErr) {
+        bestErr = e;
+        best = i;
+      }
+    }
+    return best;
+  }
+
+
+  /**
+   * \brief Packs 16 quint+1LSB weights into the 54-bit ISE weight stream
+   *
+   * C.2.12 groups 3 values into a (7 + 3*n)-bit block; with n = 1 LSB bit
+   * that is 10 bits, laid out
+   *     m0 | Q[2:0] | m1 | Q[4:3] | m2 | Q[6:5]
+   * where Q[6:0] is the packed triple of quints from quintEncodeTable().
+   * Sixteen weights are five full groups (50 bits) plus a trailing
+   * partial group holding the last value in 1 + ceil(1*7/3) = 4 bits:
+   * the LSB first, then the raw quint — the packed form of that value
+   * when Q[6:3] are zero.  5 * 10 + 4 = 54 = kAstcWeightBits.
+   *
+   * \param [in] w  16 weights, each 0..9
    * \returns       the weight stream, bit 0 = first bit of group 0
    */
-  inline uint64_t packWeightQuints(const uint32_t* w) {
+  inline uint64_t packWeightQuint1Bits(const uint32_t* w) {
     const uint8_t* enc = quintEncodeTable();
     uint64_t stream = 0;
     uint32_t bit = 0;
+    uint32_t i = 0;
 
-    for (uint32_t i = 0; i < 16; i += 3) {
-      if (16u - i >= 3u) {
-        const uint32_t idx = w[i] + 5u * w[i + 1] + 25u * w[i + 2];
-        const uint32_t Q = enc[idx];
-        assert(Q <= 127u && "quint triple has no packed form");
-        stream |= uint64_t(Q) << bit;
-        bit += 7;
-      } else {
-        assert(w[i] <= 4u);
-        stream |= uint64_t(w[i]) << bit;
-        bit += 3;
-      }
+    for (; i + 3u <= 16u; i += 3u) {
+      const uint32_t idx = (w[i] >> 1) + 5u * (w[i + 1] >> 1)
+                         + 25u * (w[i + 2] >> 1);
+      const uint32_t Q = enc[idx];
+      assert(Q <= 127u && "quint triple has no packed form");
+      stream |= uint64_t(w[i]      & 1u) << (bit + 0);
+      stream |= uint64_t(Q         & 7u) << (bit + 1);
+      stream |= uint64_t(w[i + 1]  & 1u) << (bit + 4);
+      stream |= uint64_t((Q >> 3)  & 3u) << (bit + 5);
+      stream |= uint64_t(w[i + 2]  & 1u) << (bit + 7);
+      stream |= uint64_t((Q >> 5)  & 3u) << (bit + 8);
+      bit += 10u;
     }
+
+    // 16 = 5 * 3 + 1: exactly one value remains.  A two-value remainder
+    // cannot arise for a 4x4 grid, so it is rejected rather than guessed.
+    assert(16u - i == 1u && "16 weights must leave a single trailing value");
+    assert(w[i] <= 9u && "weight index out of range");
+    stream |= uint64_t(w[i] & 1u) << (bit + 0);
+    stream |= uint64_t(w[i] >> 1) << (bit + 1);
+    bit += 4u;
+    i += 1u;
 
     assert(bit == kAstcWeightBits);
     return stream;
@@ -226,8 +310,8 @@ namespace dxvk::util {
    *
    * C.2.16 stores the weight stream downwards from block bit 127, so
    * stream bit n must land on block bit (127 - n).  Writing the reversed
-   * stream at kAstcWeightBitOffset (90) achieves exactly that: block
-   * bit 90 + j reads stream bit 37 - j.
+   * stream at kAstcWeightBitOffset (74) achieves exactly that: block
+   * bit 74 + j reads stream bit 53 - j.
    */
   inline uint64_t reverseBits(uint64_t v, uint32_t n) {
     uint64_t r = 0;
@@ -249,7 +333,7 @@ namespace dxvk::util {
   // Word-level implementation: read-modify-write on 64-bit words instead
   // of a per-bit loop. Requires little-endian host. Preserves OR-into-
   // existing-bits semantics (block starts zeroed, writes never overlap).
-  // 64-bit wide so the 38-bit ASTC weight stream can be written in one
+  // 64-bit wide so the 54-bit ASTC weight stream can be written in one
   // call without truncation.
   inline void writeBits(
           uint8_t*       block,
@@ -297,55 +381,61 @@ namespace dxvk::util {
   /**
    * \brief Writes the fixed single-partition block header
    *
-   *   bits[10:0]  = 0x51  (4x4 weight grid, weight range 0..4)
-   *   bits[12:11] = 00    (Part: single partition)
-   *   bits[16:13] = 12    (CEM: LDR RGBA, direct)
+   *   bits[10:0]  = 0x242  (4x4 weight grid, weight range 0..9)
+   *   bits[12:11] = 00     (Part: single partition)
+   *   bits[16:13] = 12     (CEM: LDR RGBA, direct)
    */
   inline void writeBlockHeader(uint8_t* block) {
-    writeBits(block, 0, kAstcBlockMode4x4Quint, 11);
+    writeBits(block, 0, kAstcBlockMode4x4, 11);
     writeBits(block, kAstcCemBitOffset, kAstcCemRgbaDirect, 4);
   }
 
 
   /**
-   * \brief Writes the 8 Mode-12 endpoint values as 8-bit raw data
+   * \brief Writes the 8 Mode-12 endpoint values as 7-bit raw data
    *
    * Mode 12 (astc_spec.txt) reads the values interleaved by channel:
    *     s0 = v0+v2+v4, s1 = v1+v3+v5
    *     s1 >= s0  →  e0 = (v0,v2,v4,v6), e1 = (v1,v3,v5,v7)
    * so v0..v7 must be stored as R0,R1,G0,G1,B0,B1,A0,A1 — NOT as the
    * two RGBA endpoints back to back.
+   *
+   * The endpoint range is 0..127 (7 bits) because remaining_bits = 57.
+   * C.2.13 restores the full range by simple bit replication from the
+   * MSB, so the encoder only has to drop the low bit (stored = value
+   * >> 1).  The round trip is then within one LSB for every input.
    */
   inline void writeEndpoints(
           uint8_t* block,
           uint8_t r0, uint8_t g0, uint8_t b0, uint8_t a0,
           uint8_t r1, uint8_t g1, uint8_t b1, uint8_t a1) {
-    writeBits(block, kAstcEndpointBitOffset +  0, r0, 8); // v0
-    writeBits(block, kAstcEndpointBitOffset +  8, r1, 8); // v1
-    writeBits(block, kAstcEndpointBitOffset + 16, g0, 8); // v2
-    writeBits(block, kAstcEndpointBitOffset + 24, g1, 8); // v3
-    writeBits(block, kAstcEndpointBitOffset + 32, b0, 8); // v4
-    writeBits(block, kAstcEndpointBitOffset + 40, b1, 8); // v5
-    writeBits(block, kAstcEndpointBitOffset + 48, a0, 8); // v6
-    writeBits(block, kAstcEndpointBitOffset + 56, a1, 8); // v7
+    const uint32_t s = kAstcEndpointValueBits;
+    writeBits(block, kAstcEndpointBitOffset + 0 * s, r0 >> 1, s); // v0
+    writeBits(block, kAstcEndpointBitOffset + 1 * s, r1 >> 1, s); // v1
+    writeBits(block, kAstcEndpointBitOffset + 2 * s, g0 >> 1, s); // v2
+    writeBits(block, kAstcEndpointBitOffset + 3 * s, g1 >> 1, s); // v3
+    writeBits(block, kAstcEndpointBitOffset + 4 * s, b0 >> 1, s); // v4
+    writeBits(block, kAstcEndpointBitOffset + 5 * s, b1 >> 1, s); // v5
+    writeBits(block, kAstcEndpointBitOffset + 6 * s, a0 >> 1, s); // v6
+    writeBits(block, kAstcEndpointBitOffset + 7 * s, a1 >> 1, s); // v7
   }
 
 
   /**
    * \brief Encodes a 4x4 RGBA8 block to ASTC 4x4
    *
-   * Single partition, no dual plane, CEM 12 (LDR RGBA direct) with 8-bit
-   * endpoint values, and a 4x4 weight grid holding 16 quint weights
-   * (5 levels).  See the kAstc* constants above for the derivations.
+   * Single partition, no dual plane, CEM 12 (LDR RGBA direct) with 7-bit
+   * endpoint values, and a 4x4 weight grid holding 16 quint+1LSB weights
+   * (10 levels).  See the kAstc* constants above for the derivations.
    *
    * Block layout (128 bits):
-   *   Bits [0:10]   — Block mode 0x51 (4x4 grid, weight range 0..4)
+   *   Bits [0:10]   — Block mode 0x242 (4x4 grid, weight range 0..9)
    *   Bits [12:11]  — Part = 00 (single partition)
    *   Bits [16:13]  — CEM = 12 (LDR RGBA direct)
-   *   Bits [17:80]  — 8 endpoint values x 8 bits, Mode-12 order:
+   *   Bits [17:72]  — 8 endpoint values x 7 bits, Mode-12 order:
    *                   v0=R0 v1=R1 v2=G0 v3=G1 v4=B0 v5=B1 v6=A0 v7=A1
-   *   Bits [89:81]  — padding (9 bits)
-   *   Bits [127:90] — weight stream (38 bits, stored downwards from 127)
+   *   Bits [73:73]  — padding (1 bit)
+   *   Bits [127:74] — weight stream (54 bits, stored downwards from 127)
    *
    * \param [in]  pixels  Input 4x4 RGBA8 pixel block (64 bytes)
    * \param [out] block   Output ASTC 4x4 block (16 bytes)
@@ -406,12 +496,13 @@ namespace dxvk::util {
     writeBlockHeader(block);
     writeEndpoints(block, minR, minG, minB, minA, maxR, maxG, maxB, maxA);
 
-    // ─── Step 4: Compute quint weights ─────────────────────────────
+    // ─── Step 4: Compute quint+1LSB weights ────────────────────────
     // For each pixel, compute interpolation factor t ∈ [0, 1] by
     // projecting onto the min→max axis in RGBA space, then quantize to
-    // the block's 5-level (0..4) weight range.  Table C.2.16 maps a
-    // stored quint w to {0, 16, 32, 48, 64}/64, i.e. exactly linear,
-    // so rounding t to the nearest quarter is the correct quantizer.
+    // the block's 10-level (0..9) weight range.  C.2.17 maps the stored
+    // indices to {0,7,14,21,28,36,43,50,57,64}/64, so the quantizer
+    // targets 0..64 directly and picks the nearest *unquantized* level —
+    // the index order itself is scrambled (index 1 -> 64).
     float rangeR = static_cast<float>(maxR) - minR;
     float rangeG = static_cast<float>(maxG) - minG;
     float rangeB = static_cast<float>(maxB) - minB;
@@ -440,14 +531,14 @@ namespace dxvk::util {
         float t = (dr * rangeR + dg * rangeG + db * rangeB + da * rangeA) * invRangeSq;
         t = t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t);
 
-        weights[i] = quantizeWeightTo(t, 4u);
+        weights[i] = quantizeWeightQuint1(t);
       }
     }
 
     // ─── Step 5: Pack weights into the block ───────────────────────
-    // ISE-pack the 16 quints into 38 bits, then store that stream
-    // downwards from block bit 127 as required by C.2.16.
-    const uint64_t stream = packWeightQuints(weights);
+    // ISE-pack the 16 quint+1LSB weights into 54 bits, then store that
+    // stream downwards from block bit 127 as required by C.2.16.
+    const uint64_t stream = packWeightQuint1Bits(weights);
     writeBits(block, kAstcWeightBitOffset,
               reverseBits(stream, kAstcWeightBits), kAstcWeightBits);
   }
