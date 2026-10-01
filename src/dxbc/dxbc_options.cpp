@@ -15,6 +15,11 @@ namespace dxvk {
     const DxvkDeviceFeatures& devFeatures = device->features();
     const DxvkDeviceInfo& devInfo = adapter->devicePropertiesExt();
 
+    // Disable unbound texture optimization on Mali GPUs due to black screen
+    // issues. The optimization emits OpConstantComposite from a spec constant,
+    // which is invalid SPIR-V and makes panVK reject the shader module.
+    disableUnboundTextureOptimization = adapter->isPanVk();
+
     useDepthClipWorkaround
       = !devFeatures.extDepthClipEnable.depthClipEnable;
     useStorageImageReadWithoutFormat

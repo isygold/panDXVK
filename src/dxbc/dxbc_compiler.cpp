@@ -3433,9 +3433,14 @@ namespace dxvk {
     
     DxbcRegisterValue mergedResult;
     mergedResult.type = result.type;
-    mergedResult.id = m_module.opSelect(getVectorTypeId(mergedResult.type),
-      emitBuildVector(bound, result.type.ccount).id, result.id,
-      emitBuildZeroVector(result.type).id);
+    // Skip unbound texture optimization on Mali GPUs to prevent black screens
+    if (m_moduleInfo.options.disableUnboundTextureOptimization) {
+      mergedResult.id = result.id;
+    } else {
+      mergedResult.id = m_module.opSelect(getVectorTypeId(mergedResult.type),
+        emitBuildVector(bound, result.type.ccount).id, result.id,
+        emitBuildZeroVector(result.type).id);
+    }
     
     emitRegisterStore(ins.dst[0], mergedResult);
   }
@@ -3542,13 +3547,15 @@ namespace dxvk {
     result = emitRegisterSwizzle(result,
       textureReg.swizzle, ins.dst[0].mask);
     
-    DxbcRegisterValue bound;
-    bound.type = { DxbcScalarType::Bool, 1 };
-    bound.id = texture.specId;
-    
-    result.id = m_module.opSelect(getVectorTypeId(result.type),
-      emitBuildVector(bound, result.type.ccount).id, result.id,
-      emitBuildZeroVector(result.type).id);
+    if (!m_moduleInfo.options.disableUnboundTextureOptimization) {
+      DxbcRegisterValue bound;
+      bound.type = { DxbcScalarType::Bool, 1 };
+      bound.id = texture.specId;
+
+      result.id = m_module.opSelect(getVectorTypeId(result.type),
+        emitBuildVector(bound, result.type.ccount).id, result.id,
+        emitBuildZeroVector(result.type).id);
+    }
 
     emitRegisterStore(ins.dst[0], result);
   }
@@ -3697,13 +3704,16 @@ namespace dxvk {
         textureReg.swizzle, ins.dst[0].mask);
     }
     
-    DxbcRegisterValue bound;
-    bound.type = { DxbcScalarType::Bool, 1 };
-    bound.id = texture.specId;
-    
-    result.id = m_module.opSelect(getVectorTypeId(result.type),
-      emitBuildVector(bound, result.type.ccount).id, result.id,
-      emitBuildZeroVector(result.type).id);
+    // Skip unbound texture optimization on Mali GPUs to prevent black screens
+    if (!m_moduleInfo.options.disableUnboundTextureOptimization) {
+      DxbcRegisterValue bound;
+      bound.type = { DxbcScalarType::Bool, 1 };
+      bound.id = texture.specId;
+
+      result.id = m_module.opSelect(getVectorTypeId(result.type),
+        emitBuildVector(bound, result.type.ccount).id, result.id,
+        emitBuildZeroVector(result.type).id);
+    }
 
     emitRegisterStore(ins.dst[0], result);
   }
