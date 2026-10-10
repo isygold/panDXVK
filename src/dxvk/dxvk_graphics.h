@@ -1,6 +1,7 @@
 #pragma once
 
 #include <mutex>
+#include <vector>
 
 #include "../util/sync/sync_list.h"
 
@@ -216,8 +217,43 @@ namespace dxvk {
     void compilePipeline(
       const DxvkGraphicsPipelineStateInfo&    state,
       const DxvkRenderPass*                   renderPass);
+
+    /**
+     * \brief Compiles a pipeline for the async compiler
+     *
+     * Stores the result for future use and, if
+     * enabled, writes the state to the cache.
+     * \param [in] state Pipeline state vector
+     * \param [in] renderPass The render pass
+     * \returns \c true if a pipeline was created
+     */
+    bool compilePipelineAsync(
+      const DxvkGraphicsPipelineStateInfo&    state,
+      const DxvkRenderPass*                   renderPass);
     
   private:
+
+    /**
+     * Identifies a pipeline library. Only the parts of the
+     * state that the library depends on are filled in, the
+     * rest stays zero so that equal keys mean equal libraries.
+     */
+    struct LibraryKey {
+      DxvkGraphicsPipelineStateInfo state;
+      const DxvkRenderPass*         renderPass = nullptr;
+      uint64_t                      extra      = 0;
+
+      bool operator == (const LibraryKey& other) const {
+        return state      == other.state
+            && renderPass == other.renderPass
+            && extra      == other.extra;
+      }
+    };
+
+    struct LibraryEntry {
+      LibraryKey key;
+      VkPipeline pipeline;
+    };
     
     Rc<vk::DeviceFn>            m_vkd;
     DxvkPipelineManager*        m_pipeMgr;
@@ -237,6 +273,12 @@ namespace dxvk {
     alignas(CACHE_LINE_SIZE)
     dxvk::mutex                               m_mutex;
     sync::List<DxvkGraphicsPipelineInstance>  m_pipelines;
+
+    // Pipeline libraries, only accessed while m_mutex is held
+    std::vector<LibraryEntry>   m_vertexInputLibs;
+    std::vector<LibraryEntry>   m_preRasterLibs;
+    std::vector<LibraryEntry>   m_fragmentShaderLibs;
+    std::vector<LibraryEntry>   m_fragmentOutputLibs;
     
     DxvkGraphicsPipelineInstance* createInstance(
       const DxvkGraphicsPipelineStateInfo& state,
@@ -249,6 +291,38 @@ namespace dxvk {
     VkPipeline createPipeline(
       const DxvkGraphicsPipelineStateInfo& state,
       const DxvkRenderPass*                renderPass) const;
+
+    VkPipeline linkPipeline(
+      const DxvkGraphicsPipelineStateInfo& state,
+      const DxvkRenderPass*                renderPass);
+
+    VkPipeline findLibrary(
+      const std::vector<LibraryEntry>&     libs,
+      const LibraryKey&                    key) const;
+
+    VkPipeline getVertexInputLibrary(
+      const DxvkGraphicsPipelineStateInfo& state,
+            bool&                          created);
+
+    VkPipeline getPreRasterLibrary(
+      const DxvkGraphicsPipelineStateInfo& state,
+      const DxvkRenderPass*                renderPass,
+            bool&                          created);
+
+    VkPipeline getFragmentShaderLibrary(
+      const DxvkGraphicsPipelineStateInfo& state,
+      const DxvkRenderPass*                renderPass,
+            bool&                          created);
+
+    VkPipeline getFragmentOutputLibrary(
+      const DxvkGraphicsPipelineStateInfo& state,
+      const DxvkRenderPass*                renderPass,
+            bool&                          created);
+
+    VkPipeline createLibrary(
+            VkGraphicsPipelineCreateInfo&     info,
+            VkGraphicsPipelineLibraryFlagsEXT flags,
+            uint32_t                          index) const;
     
     void destroyPipeline(
             VkPipeline                     pipeline) const;

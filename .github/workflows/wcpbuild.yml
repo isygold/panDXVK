@@ -3,24 +3,18 @@ name: WCP Build
 on:
   workflow_dispatch:
     inputs:
-      version_name:
-        description: 'Version number, e.g. 1.10.3.0 (will become pandxvk-1.10.3.0-<sha> in profile.json)'
-        required: true
-        type: string
-        default: '1.10.3'
-      version_code:
-        description: 'Build number (auto if blank)'
-        required: false
-        type: string
-        default: ''
       release_description:
-        description: 'Short description for profile.json'
+        description: 'Short description for profile.json (spaces become hyphens)'
         required: false
         type: string
-        default: 'panDXVK - DXVK fork for PanVK/Mali-G720'
+        default: 'Casync-panDXVK-for-PanVK-Mali'
 
 permissions:
   actions: read
+  contents: read
+
+env:
+  NAME_PREFIX: panDXVK-1.10.3-Casync
 
 jobs:
   build:
@@ -33,56 +27,52 @@ jobs:
       - name: Install zstd
         run: sudo apt-get update -y && sudo apt-get install -y zstd
 
-      - name: Resolve version inputs
-        id: version
-        run: |
-          VNAME="${{ inputs.version_name }}"
-          echo "version_name=$VNAME" >> "$GITHUB_OUTPUT"
-
-          # Auto versionCode if not provided: use timestamp
-          VCODE="${{ inputs.version_code }}"
-          if [ -z "$VCODE" ]; then
-            VCODE=$(date +%s)
-          fi
-          echo "version_code=$VCODE" >> "$GITHUB_OUTPUT"
-
-      - name: Get build SHA and run ID for this commit
+      - name: Get latest build SHA and run ID
         id: get-sha
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # Resolve against THIS commit, not "the latest successful run".
-          # Picking the newest build.yml run means a WCP dispatched on commit X
-          # can silently package commit Y's DLLs, and it fails outright when
-          # that run's artifacts have been purged (seen 2026-10-06: the newest
-          # run was 51bb8827, whose artifacts had been deleted with it).
-          TARGET="${{ github.sha }}"
           RUNS=$(gh run list --repo ${{ github.repository }} --workflow build.yml --branch main \
             --status success --limit 20 --json headSha,databaseId)
-          MATCH=$(printf '%s' "$RUNS" | python3 -c '
+          LIST=$(printf '%s' "$RUNS" | python3 -c '
           import sys, json
-          target = sys.argv[1]
           for r in json.load(sys.stdin):
-              if r["headSha"] == target:
-                  print(r["headSha"], r["databaseId"])
-                  break
-          ' "$TARGET")
-          if [ -z "$MATCH" ]; then
-            echo "::error::No successful build.yml run found for commit ${TARGET:0:7}."
-            echo "::error::Trigger Build DXVK (x64 + x32) on this commit first."
-            exit 1
-          fi
-          FULL_SHA=$(printf '%s' "$MATCH" | cut -d' ' -f1)
-          RUN_ID=$(printf '%s' "$MATCH" | cut -d' ' -f2)
-          COUNT=$(gh api "repos/${{ github.repository }}/actions/runs/$RUN_ID/artifacts" --jq '.total_count')
-          if [ "$COUNT" = "0" ]; then
-            echo "::error::Build run for ${TARGET:0:7} has no artifacts (purged or expired)."
-            echo "::error::Re-run Build DXVK (x64 + x32) on this commit."
+              print(r["headSha"], r["databaseId"])
+          ')
+          FULL_SHA=""
+          RUN_ID=""
+          while read -r SHA ID; do
+            [ -z "$ID" ] && continue
+            COUNT=$(gh api "repos/${{ github.repository }}/actions/runs/$ID/artifacts" --jq '.total_count')
+            if [ "$COUNT" != "0" ]; then
+              FULL_SHA="$SHA"
+              RUN_ID="$ID"
+              break
+            fi
+          done <<< "$LIST"
+          if [ -z "$RUN_ID" ]; then
+            echo "::error::No successful build.yml run with artifacts found on main."
+            echo "::error::Run Build DXVK (x64 + x32) first."
             exit 1
           fi
           echo "full_sha=$FULL_SHA" >> "$GITHUB_OUTPUT"
           echo "sha=${FULL_SHA:0:7}" >> "$GITHUB_OUTPUT"
           echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Check the build is the newest commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          BUILT="${{ steps.get-sha.outputs.full_sha }}"
+          HEAD_SHA=$(gh api "repos/${{ github.repository }}/commits/main" --jq '.sha')
+          echo "Packaging DLLs built from ${BUILT:0:7}, main is at ${HEAD_SHA:0:7}"
+          if [ "$BUILT" != "$HEAD_SHA" ]; then
+            echo "::warning::These DLLs are from ${BUILT:0:7} but main is at ${HEAD_SHA:0:7}. Run Build DXVK again to include the newest commit."
+          fi
+
+      - name: Package name
+        run: |
+          echo "PKG_NAME=${NAME_PREFIX}-${{ steps.get-sha.outputs.sha }}" >> "$GITHUB_ENV"
 
       - name: Download build DLLs
         uses: actions/download-artifact@v4
@@ -108,55 +98,47 @@ jobs:
           mv x32 syswow64
 
       - name: Package WCP
+        env:
+          RELEASE_DESC: ${{ inputs.release_description }}
         run: |
           cd ./workdir
-          cat > profile.json << 'JSONEOF'
-          {
-            "type": "DXVK",
-            "versionName": "pandxvk-${{ steps.version.outputs.version_name }}",
-            "versionCode": ${{ steps.version.outputs.version_code }},
-            "description": "${{ inputs.release_description }}",
-            "files": [
-              {"source": "system32/d3d9.dll",      "target": "${system32}/d3d9.dll"},
-              {"source": "system32/d3d10.dll",     "target": "${system32}/d3d10.dll"},
-              {"source": "system32/d3d10_1.dll",   "target": "${system32}/d3d10_1.dll"},
-              {"source": "system32/d3d10core.dll", "target": "${system32}/d3d10core.dll"},
-              {"source": "system32/d3d11.dll",     "target": "${system32}/d3d11.dll"},
-              {"source": "system32/dxgi.dll",      "target": "${system32}/dxgi.dll"},
-              {"source": "syswow64/d3d9.dll",      "target": "${syswow64}/d3d9.dll"},
-              {"source": "syswow64/d3d10.dll",     "target": "${syswow64}/d3d10.dll"},
-              {"source": "syswow64/d3d10_1.dll",   "target": "${syswow64}/d3d10_1.dll"},
-              {"source": "syswow64/d3d10core.dll", "target": "${syswow64}/d3d10core.dll"},
-              {"source": "syswow64/d3d11.dll",     "target": "${syswow64}/d3d11.dll"},
-              {"source": "syswow64/dxgi.dll",      "target": "${syswow64}/dxgi.dll"}
-            ]
-          }
-          JSONEOF
-          tar --zstd -cf "../pandxvk-${{ steps.version.outputs.version_name }}.wcp" \
-            system32/ syswow64/ profile.json
+          python3 - <<'PY'
+          import json, os
 
-      - name: Wrap WCP in zip
-        run: |
-          python3 -c "
-          import zipfile, glob
-          wcp_files = glob.glob('*.wcp')
-          if not wcp_files:
-              raise SystemExit('ERROR: No .wcp files found in $GITHUB_WORKSPACE')
-          print(f'Packing {len(wcp_files)} file(s): {wcp_files}')
-          with zipfile.ZipFile('wcp.zip', 'w', zipfile.ZIP_STORED) as zf:
-              for f in wcp_files:
-                  zf.write(f)
-          "
-          ls -lh wcp.zip
+          desc = '-'.join(os.environ['RELEASE_DESC'].replace('/', ' ').split())
+          if not desc:
+              desc = 'Casync-panDXVK'
+
+          dlls = ['d3d9', 'd3d10', 'd3d10_1', 'd3d10core', 'd3d11', 'dxgi']
+          files = []
+          for folder, var in (('system32', '${system32}'), ('syswow64', '${syswow64}')):
+              for name in dlls:
+                  files.append({
+                      'source': folder + '/' + name + '.dll',
+                      'target': var + '/' + name + '.dll',
+                  })
+
+          profile = {
+              'type': 'DXVK',
+              'versionName': os.environ['PKG_NAME'],
+              'versionCode': 0,
+              'description': desc,
+              'files': files,
+          }
+
+          with open('profile.json', 'w') as f:
+              json.dump(profile, f, indent=2)
+          PY
+
+          cat profile.json
+          tar -cf ../pandxvk.tar system32/ syswow64/ profile.json
+          zstd -22 -f ../pandxvk.tar -o "../${PKG_NAME}.wcp"
+          rm ../pandxvk.tar
+          ls -l "../${PKG_NAME}.wcp"
 
       - name: Upload WCP
         uses: actions/upload-artifact@v4
         with:
-          name: wcp-pandxvk-${{ steps.version.outputs.version_name }}-${{ steps.get-sha.outputs.sha }}
-          path: ./wcp.zip
-
-      - name: Upload panDXVK config
-        uses: actions/upload-artifact@v4
-        with:
-          name: pandxvk-config-${{ steps.version.outputs.version_name }}-${{ steps.get-sha.outputs.sha }}
-          path: pandxvk/
+          name: wcp-${{ env.PKG_NAME }}
+          path: ./${{ env.PKG_NAME }}.wcp
+          compression-level: 0

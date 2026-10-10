@@ -1,11 +1,13 @@
-
 #pragma once
 
+#include <atomic>
+#include <memory>
 #include <mutex>
 #include <unordered_map>
 
 #include "dxvk_compute.h"
 #include "dxvk_graphics.h"
+#include "dxvk_pipecompiler.h"
 
 namespace dxvk {
 
@@ -20,6 +22,29 @@ namespace dxvk {
   struct DxvkPipelineCount {
     uint32_t numGraphicsPipelines;
     uint32_t numComputePipelines;
+  };
+
+
+  /**
+   * \brief Graphics pipeline library statistics
+   *
+   * Counters are indexed by library type: vertex input,
+   * pre-rasterization, fragment shader, fragment output.
+   */
+  struct DxvkGplStats {
+    DxvkGplStats() {
+      for (uint32_t i = 0; i < 4; i++) {
+        created[i] = 0;
+        reused[i]  = 0;
+      }
+    }
+
+    std::atomic<uint32_t> created[4];
+    std::atomic<uint32_t> reused[4];
+    std::atomic<uint32_t> linked     = { 0 };
+    std::atomic<uint32_t> fallbacks  = { 0 };
+    std::atomic<uint64_t> libMicros  = { 0 };
+    std::atomic<uint64_t> linkMicros = { 0 };
   };
   
   
@@ -103,6 +128,13 @@ namespace dxvk {
 
     std::atomic<uint32_t>     m_numComputePipelines  = { 0 };
     std::atomic<uint32_t>     m_numGraphicsPipelines = { 0 };
+
+    bool                      m_gplAsyncCache = false;
+    bool                      m_asyncLog = false;
+    bool                      m_gplRequested = false;
+
+    std::atomic<bool>         m_gplLibraries = { false };
+    DxvkGplStats              m_gplStats;
     
     dxvk::mutex m_mutex;
     
@@ -115,6 +147,8 @@ namespace dxvk {
       DxvkGraphicsPipelineShaders,
       DxvkGraphicsPipeline,
       DxvkHash, DxvkEq> m_graphicsPipelines;
+
+    std::unique_ptr<DxvkPipelineCompiler> m_compiler;
     
   };
   

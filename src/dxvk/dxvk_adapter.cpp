@@ -285,7 +285,7 @@ namespace dxvk {
           DxvkDeviceFeatures  enabledFeatures) {
     DxvkDeviceExtensions devExtensions;
 
-    std::array<DxvkExt*, 32> devExtensionList = {{
+    std::array<DxvkExt*, 34> devExtensionList = {{
       &devExtensions.amdMemoryOverallocationBehaviour,
       &devExtensions.amdShaderFragmentMask,
       &devExtensions.ext4444Formats,
@@ -294,6 +294,7 @@ namespace dxvk {
       &devExtensions.extDepthClipEnable,
       &devExtensions.extExtendedDynamicState,
       &devExtensions.extFullScreenExclusive,
+      &devExtensions.extGraphicsPipelineLibrary,
       &devExtensions.extHostQueryReset,
       &devExtensions.extMemoryBudget,
       &devExtensions.extMemoryPriority,
@@ -312,6 +313,7 @@ namespace dxvk {
       &devExtensions.khrExternalMemoryWin32,
       &devExtensions.khrExternalSemaphoreWin32,
       &devExtensions.khrImageFormatList,
+      &devExtensions.khrPipelineLibrary,
       &devExtensions.khrSamplerMirrorClampToEdge,
       &devExtensions.khrShaderFloatControls,
       &devExtensions.khrSwapchain,
@@ -336,6 +338,15 @@ namespace dxvk {
       enabledFeatures.khrBufferDeviceAddress.bufferDeviceAddress = VK_TRUE;
     }
 
+    bool enableGpl = m_deviceExtensions.supports(devExtensions.khrPipelineLibrary.name())
+      && m_deviceFeatures.extGraphicsPipelineLibrary.graphicsPipelineLibrary
+      && m_deviceInfo.extGraphicsPipelineLibrary.graphicsPipelineLibraryFastLinking;
+
+    if (!enableGpl) {
+      devExtensions.extGraphicsPipelineLibrary.setMode(DxvkExtMode::Disabled);
+      devExtensions.khrPipelineLibrary.setMode(DxvkExtMode::Disabled);
+    }
+
     DxvkNameSet extensionsEnabled;
 
     if (!m_deviceExtensions.enableExtensions(
@@ -350,6 +361,7 @@ namespace dxvk {
 
     // Enable additional device features if supported
     enabledFeatures.extExtendedDynamicState.extendedDynamicState = m_deviceFeatures.extExtendedDynamicState.extendedDynamicState;
+    enabledFeatures.extGraphicsPipelineLibrary.graphicsPipelineLibrary = enableGpl;
 
     enabledFeatures.ext4444Formats.formatA4B4G4R4 = m_deviceFeatures.ext4444Formats.formatA4B4G4R4;
     enabledFeatures.ext4444Formats.formatA4R4G4B4 = m_deviceFeatures.ext4444Formats.formatA4R4G4B4;
@@ -442,6 +454,11 @@ namespace dxvk {
     if (devExtensions.extExtendedDynamicState) {
       enabledFeatures.extExtendedDynamicState.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT;
       enabledFeatures.extExtendedDynamicState.pNext = std::exchange(enabledFeatures.core.pNext, &enabledFeatures.extExtendedDynamicState);
+    }
+
+    if (devExtensions.extGraphicsPipelineLibrary) {
+      enabledFeatures.extGraphicsPipelineLibrary.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT;
+      enabledFeatures.extGraphicsPipelineLibrary.pNext = std::exchange(enabledFeatures.core.pNext, &enabledFeatures.extGraphicsPipelineLibrary);
     }
 
     if (devExtensions.extHostQueryReset) {
@@ -678,6 +695,11 @@ namespace dxvk {
       m_deviceInfo.extCustomBorderColor.pNext = std::exchange(m_deviceInfo.core.pNext, &m_deviceInfo.extCustomBorderColor);
     }
 
+    if (m_deviceExtensions.supports(VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME)) {
+      m_deviceInfo.extGraphicsPipelineLibrary.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_PROPERTIES_EXT;
+      m_deviceInfo.extGraphicsPipelineLibrary.pNext = std::exchange(m_deviceInfo.core.pNext, &m_deviceInfo.extGraphicsPipelineLibrary);
+    }
+
     if (m_deviceExtensions.supports(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME)) {
       m_deviceInfo.extRobustness2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_PROPERTIES_EXT;
       m_deviceInfo.extRobustness2.pNext = std::exchange(m_deviceInfo.core.pNext, &m_deviceInfo.extRobustness2);
@@ -764,6 +786,11 @@ namespace dxvk {
       m_deviceFeatures.extExtendedDynamicState.pNext = std::exchange(m_deviceFeatures.core.pNext, &m_deviceFeatures.extExtendedDynamicState);
     }
 
+    if (m_deviceExtensions.supports(VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME)) {
+      m_deviceFeatures.extGraphicsPipelineLibrary.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT;
+      m_deviceFeatures.extGraphicsPipelineLibrary.pNext = std::exchange(m_deviceFeatures.core.pNext, &m_deviceFeatures.extGraphicsPipelineLibrary);
+    }
+
     if (m_deviceExtensions.supports(VK_EXT_HOST_QUERY_RESET_EXTENSION_NAME)) {
       m_deviceFeatures.extHostQueryReset.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES_EXT;
       m_deviceFeatures.extHostQueryReset.pNext = std::exchange(m_deviceFeatures.core.pNext, &m_deviceFeatures.extHostQueryReset);
@@ -810,6 +837,27 @@ namespace dxvk {
     }
 
     m_vki->vkGetPhysicalDeviceFeatures2(m_handle, &m_deviceFeatures.core);
+    
+    if (m_deviceExtensions.supports(VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME)) {
+      const auto& gplFeatures = m_deviceFeatures.extGraphicsPipelineLibrary;
+      const auto& gplProps    = m_deviceInfo.extGraphicsPipelineLibrary;
+
+      bool hasLibraryExt = m_deviceExtensions.supports(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME) != 0;
+
+      bool usable = hasLibraryExt
+        && gplFeatures.graphicsPipelineLibrary
+        && gplProps.graphicsPipelineLibraryFastLinking
+        && gplProps.graphicsPipelineLibraryIndependentInterpolationDecoration;
+
+      Logger::info(str::format("panDXVK: graphics pipeline library: feature=",
+        gplFeatures.graphicsPipelineLibrary ? 1 : 0, ", fast linking=",
+        gplProps.graphicsPipelineLibraryFastLinking ? 1 : 0, ", independent interpolation=",
+        gplProps.graphicsPipelineLibraryIndependentInterpolationDecoration ? 1 : 0,
+        ", VK_KHR_pipeline_library=", hasLibraryExt ? 1 : 0, " -> ",
+        usable ? "usable by PANDXVK_GPLASYNC=2" : "not usable, PANDXVK_GPLASYNC=2 runs as 1"));
+    } else {
+      Logger::info("panDXVK: graphics pipeline library: extension not exposed, PANDXVK_GPLASYNC=2 runs as 1");
+    }
   }
 
 
@@ -885,6 +933,8 @@ namespace dxvk {
       "\n  depthClipEnable                        : ", features.extDepthClipEnable.depthClipEnable ? "1" : "0",
       "\n", VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME,
       "\n  extendedDynamicState                   : ", features.extExtendedDynamicState.extendedDynamicState ? "1" : "0",
+      "\n", VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME,
+      "\n  graphicsPipelineLibrary                : ", features.extGraphicsPipelineLibrary.graphicsPipelineLibrary ? "1" : "0",
       "\n", VK_EXT_HOST_QUERY_RESET_EXTENSION_NAME,
       "\n  hostQueryReset                         : ", features.extHostQueryReset.hostQueryReset ? "1" : "0",
       "\n", VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME,

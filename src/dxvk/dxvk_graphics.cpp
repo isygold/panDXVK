@@ -1,7 +1,10 @@
+#include <atomic>
+
 #include "../util/util_time.h"
 
 #include "dxvk_device.h"
 #include "dxvk_graphics.h"
+#include "dxvk_pipecompiler.h"
 #include "dxvk_pipemanager.h"
 #include "dxvk_spec_const.h"
 #include "dxvk_state_cache.h"
@@ -43,6 +46,16 @@ namespace dxvk {
   DxvkGraphicsPipeline::~DxvkGraphicsPipeline() {
     for (const auto& instance : m_pipelines)
       this->destroyPipeline(instance.pipeline());
+
+    auto destroyAll = [this] (const std::vector<LibraryEntry>& libs) {
+      for (const auto& lib : libs)
+        this->destroyPipeline(lib.pipeline);
+    };
+
+    destroyAll(m_vertexInputLibs);
+    destroyAll(m_preRasterLibs);
+    destroyAll(m_fragmentShaderLibs);
+    destroyAll(m_fragmentOutputLibs);
   }
   
   
@@ -67,8 +80,24 @@ namespace dxvk {
 
     if (unlikely(!instance)) {
       // Exit early if the state vector is invalid
-      if (!this->validatePipelineState(state, true))
+      if (!this->validatePipelineState(state, true)) {
+        if (m_pipeMgr->m_asyncLog) {
+          static std::atomic<uint32_t> count = { 0 };
+
+          if (count.fetch_add(1) < 10) {
+            Logger::warn(str::format("panDXVK async: draw dropped, invalid pipeline state, vs=",
+              m_shaders.vs->debugName()));
+          }
+        }
+
         return VK_NULL_HANDLE;
+      }
+
+      // Hand the pipeline to the async compiler and skip the draw
+      if (m_pipeMgr->m_compiler != nullptr) {
+        m_pipeMgr->m_compiler->queueCompilation(this, state, renderPass);
+        return VK_NULL_HANDLE;
+      }
 
       // Prevent other threads from adding new instances and check again
       std::lock_guard<dxvk::mutex> lock(m_mutex);
@@ -102,10 +131,54 @@ namespace dxvk {
   }
 
 
+  bool DxvkGraphicsPipeline::compilePipelineAsync(
+    const DxvkGraphicsPipelineStateInfo& state,
+    const DxvkRenderPass*                renderPass) {
+    std::lock_guard<dxvk::mutex> lock(m_mutex);
+
+    DxvkGraphicsPipelineInstance* instance = this->findInstance(state, renderPass);
+
+    if (!instance) {
+      instance = this->createInstance(state, renderPass);
+
+      if (m_pipeMgr->m_gplAsyncCache && instance->pipeline() != VK_NULL_HANDLE) {
+        this->writePipelineStateToCache(state, renderPass->format());
+
+        if (m_pipeMgr->m_asyncLog) {
+          Logger::info(str::format("panDXVK async: state cache ",
+            m_pipeMgr->m_stateCache != nullptr ? "write for " : "disabled, nothing written for ",
+            "vs=", m_shaders.vs->debugName()));
+        }
+      }
+    }
+
+    return instance->pipeline() != VK_NULL_HANDLE;
+  }
+
+
   DxvkGraphicsPipelineInstance* DxvkGraphicsPipeline::createInstance(
     const DxvkGraphicsPipelineStateInfo& state,
     const DxvkRenderPass*                renderPass) {
-    VkPipeline pipeline = this->createPipeline(state, renderPass);
+    VkPipeline pipeline = VK_NULL_HANDLE;
+
+    if (m_pipeMgr->m_gplLibraries.load()) {
+      pipeline = this->linkPipeline(state, renderPass);
+
+      if (pipeline == VK_NULL_HANDLE) {
+        uint32_t count = m_pipeMgr->m_gplStats.fallbacks.fetch_add(1) + 1;
+
+        Logger::warn(str::format("panDXVK gplasync: library path failed, compiling normally, vs=",
+          m_shaders.vs->debugName()));
+
+        if (count >= 8 && m_pipeMgr->m_gplLibraries.exchange(false)) {
+          Logger::err(str::format("panDXVK gplasync: library path disabled after ",
+            count, " failures, continuing with normal compiles"));
+        }
+      }
+    }
+
+    if (pipeline == VK_NULL_HANDLE)
+      pipeline = this->createPipeline(state, renderPass);
 
     m_pipeMgr->m_numGraphicsPipelines += 1;
     return &(*m_pipelines.emplace(state, renderPass, pipeline));
