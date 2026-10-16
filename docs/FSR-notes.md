@@ -146,13 +146,7 @@ What to look for:
 - `not applied (...)`: the reason is one of the cases in section 4.4.
 - `sharpening only`: the sizes matched, which is the usual case on Winlator.
 
-## 8. Test results
-
-**AIO Graphics Test, textured cube, red-tint test.** The sharpening step's output
-was temporarily tinted red. The whole game window turned red, which confirms the
-step runs and that its result is what you see on screen.
-
-## 9. Limitations
+## 8. Limitations
 
 - The Direct3D 9 path probably shares this code, but it has not been tested.
 - The skip cases for multisampling, gamma ramps and partial updates have not been
