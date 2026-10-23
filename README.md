@@ -234,3 +234,8 @@ Every finding in [Testers' Findings](#testers-findings) above is theirs, not our
 - DXVK Sarek: [pythonlover02/dxvk-sarek](https://github.com/pythonlover02/dxvk-sarek)
 - Forked from: [pythonlover02/dxvk-sarek@v1.14.1](https://github.com/pythonlover02/dxvk-sarek/tree/v1.14.1)
 - Upstream latest: [v3.1](https://github.com/doitsujin/dxvk/releases/tag/v3.1)
+
+## Disclaimer
+
+*AI assistance tools were used only in the calculative performance metrics and debugging of
+this project.*
